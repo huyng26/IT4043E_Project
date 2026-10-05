@@ -1,0 +1,71 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+ENV/
+
+# JavaScript and dashboard dependencies/build output
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.next/
+.cache/
+
+# Notebooks and local tooling
+.ipynb_checkpoints/
+
+# Generated data, models, and checkpoints
+/data/raw/
+/data/processed/
+/data/outputs/
+/data/models/
+/data/checkpoints/
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.onnx
+
+# Local infrastructure state and logs
+*.log
+logs/
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+
+# Preserve placeholders in otherwise empty directories
+!.gitkeep
