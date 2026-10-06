@@ -1,6 +1,6 @@
 # Real-Time Urban Air Quality Monitoring
 
-IT4868E project for monitoring and forecasting urban air quality using OpenAQ, Open-Meteo, Kafka, Spark, MinIO/S3, ClickHouse, machine learning, and FastAPI.
+IT4043E project for monitoring and forecasting urban air quality using OpenAQ, Open-Meteo, Kafka, Spark, MinIO/S3, ClickHouse, machine learning, and FastAPI.
 
 ## Structure
 
