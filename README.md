@@ -5,7 +5,7 @@ IT4043E project for monitoring and forecasting urban air quality using OpenAQ, O
 ## Structure
 
 ```text
-IT4868E_Project/
+IT4043E_Project/
 ├── README.md
 ├── docs/              # Project documentation
 ├── config/            # Application settings
