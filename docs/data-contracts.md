@@ -13,7 +13,7 @@ Topic partition counts and retention depend on station volume and recovery requi
 
 Proposed common envelope:
 
-| Field | Meaning |
+| Field | Meaning |Kubernetes
 | --- | --- |
 | `schema_version` | Contract version for parsing and migration. |
 | `event_id` | Stable identity derived from source keys, valid time, and variable/type; record revisions separately. |

@@ -1,6 +1,6 @@
 # Real-Time Urban Air Quality Monitoring
 
-IT4043E project for monitoring and forecasting urban air quality using OpenAQ, Open-Meteo, Kafka, Spark, MinIO/S3, ClickHouse, machine learning, and FastAPI.
+IT4043E project for monitoring and forecasting urban air quality using OpenAQ, Open-Meteo, Kafka, Spark, HDFS, MongoDB, Spark MLlib, GraphFrames, FastAPI, and Kubernetes.
 
 ## Structure
 
@@ -21,4 +21,4 @@ IT4043E_Project/
 
 The repository currently contains the project plan and directory structure. Keep small samples in `data/`; store credentials, generated models, checkpoints, and large datasets outside Git. Use root-level dependency and configuration files as implementation begins.
 
-Read the [implementation plan](docs/implementation-plan.md), [architecture](docs/architecture.md), and [data contracts](docs/data-contracts.md).
+Start with the [detailed system design](docs/system-design.md), which records the agreed Lambda architecture, required technologies, Spark assessment coverage, and implementation milestones. It supersedes the preliminary choices in the [implementation plan](docs/implementation-plan.md), [architecture](docs/architecture.md), and [data contracts](docs/data-contracts.md).
