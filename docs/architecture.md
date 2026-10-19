@@ -1,51 +1,65 @@
-# Proposed architecture
+# Architecture
 
-## Data flow
+The [detailed system design](system-design.md) is the authoritative design. The assessed deployment uses Lambda architecture with Kafka, PySpark, HDFS, MongoDB, Kubernetes, Spark MLlib, and GraphFrames.
+
+## First executable path
+
+```text
+Synthetic JSONL fixture → validation and normalization → revision selection → hourly JSON results
+```
+
+`python3 -m streaming.replay data/sample_measurements.jsonl` runs this path without infrastructure. `streaming/measurements.py` contains the initial hourly PM2.5 rules; `streaming/replay.py` handles bounded replay and reporting. These rules and their tests provide a reference for subsequent Spark implementations. The local path has no durable state and does not demonstrate cluster operation or distributed write guarantees.
+
+## Target data flow
 
 ```mermaid
 flowchart TD
-    OA[OpenAQ API] --> COL[Python collectors]
-    OM[Open-Meteo API] --> COL
+    OA[OpenAQ] --> COL[Python collectors]
+    OM[Open-Meteo] --> COL
     COL --> K[Kafka: air_quality_raw and weather_raw]
-    K --> SP[Spark Structured Streaming]
-    K --> AR[Independent raw archive consumer]
-    AR --> RAW[MinIO / S3]
-    SP --> CH[ClickHouse: stations, measurements, hourly_metrics, weather]
-    CH --> ML[ML training and scheduled inference]
-    ML --> PRED[ClickHouse: predictions]
-    CH --> API[FastAPI]
+    K --> AR[Spark raw archive query]
+    AR --> H[HDFS immutable raw history]
+    K --> SP[Spark speed processing]
+    SP --> MV[MongoDB speed and current views]
+    H --> B[Spark batch processing]
+    B --> P[HDFS curated Parquet and features]
+    B --> BV[MongoDB versioned batch views]
+    P --> ML[Spark MLlib training and inference]
+    ML --> PRED[MongoDB forecasts]
+    P --> G[GraphFrames station analysis]
+    G --> GA[MongoDB graph results]
+    MV --> API[FastAPI serving layer]
+    BV --> API
     PRED --> API
+    GA --> API
     API --> UI[React dashboard]
-    CH -. Grafana dashboard option .-> G[Grafana]
 ```
 
-OpenAQ and Open-Meteo are polled independently. Weather is associated with air-quality stations by coordinates and time. The two feeds do not require sequential API calls.
+Collectors poll the two providers independently. Weather is associated with stations using an explicit coordinate/location mapping. Raw archival and speed processing progress independently. Both speed and batch paths must apply equivalent validation, unit, revision, and aggregation policies.
 
-Spark validates and cleans data, handles duplicates and late records, creates hourly metrics, and calculates AQI under the chosen standard. The archive consumer reads Kafka with its own consumer group and writes raw events to MinIO/S3; it lives in `collectors/` alongside polling code.
-
-The ML pipeline reads curated history, trains a model, and periodically writes 1–24-hour concentration forecasts to `predictions`. FastAPI reads monitoring data and predictions from ClickHouse. Training does not run inside API requests.
+Batch jobs rebuild corrected history from a fixed archive snapshot. FastAPI selects published batch results for keys whose latest processed input is covered, and speed results for newer changes or missing batch keys. Every result exposes its serving provenance.
 
 ## Folder responsibilities
 
 | Folder | Responsibility |
 | --- | --- |
-| `config/` | Station selection, polling intervals, units/AQI policy, and model settings. |
-| `collectors/` | OpenAQ polling, weather polling, source progress, and the raw archive consumer. |
-| `streaming/` | Spark processing and ClickHouse writes. |
-| `ml/` | Dataset preparation, features, training, evaluation, and inference. |
-| `api/` | FastAPI endpoints and database queries. |
-| `dashboard/` | One initial UI: React using the API or Grafana querying ClickHouse. |
-| `infra/` | Compose, runtime configuration, topic/bucket setup, and table SQL. |
-| `tests/` | Focused unit/integration checks and fixtures. |
-| `data/` | Small local samples and development outputs. |
-| `docs/` | Project plan, contracts, setup instructions, and design decisions. |
+| `config/` | Selected stations, cadence, polling intervals, unit/quality rules, and model settings. |
+| `collectors/` | Provider discovery, polling, adapters, and durable source progress. |
+| `streaming/` | Initial local processing rules and replay; future Spark raw archive, speed, and batch entry points. |
+| `ml/` | Features, chronological evaluation, MLlib training/inference, and graph analysis entry points. |
+| `api/` | FastAPI endpoints, MongoDB queries, and speed/batch serving selection. |
+| `dashboard/` | React UI using FastAPI. |
+| `infra/` | kind/Kubernetes manifests, topic setup, MongoDB indexes, and runtime configuration. |
+| `tests/` | Processing regression checks, fixtures, and future integration/failure checks. |
+| `data/` | Small labeled samples; generated local outputs in ignored directories. |
+| `docs/` | Design, contracts, implementation sequence, and future operational/evidence documentation. |
 
-Folders organize code; they do not require separate deployments or nested Python packages. Add entry points and dependency files during implementation, keeping service-specific dependencies separate where needed.
+Keep the component structure small. Add service-specific dependencies when those services are implemented; the first local slice requires only Python 3.11+.
 
-## Reliability essentials
+## Reliability and deployment
 
-Use stable event identities and UTC timestamps. Preserve raw data for replay and audit. Persist collector progress and Spark checkpoints, and define retry-safe writes rather than assuming database keys enforce uniqueness.
+Use stable observation identities, separate payload revisions, and UTC timestamps. Retain original collection metadata during replay. Resolve current revisions before aggregation so corrections replace earlier contributions, including when a correction makes a reading unusable.
 
-Set a documented late-data policy and support bounded reconciliation/backfill. Record aggregate coverage, units, quality flags, and the AQI standard. Forecasts include origin, target time, model version, and input freshness.
+HDFS stores immutable raw events, curated history, models, and checkpoints. MongoDB stores regular collections with deterministic keys, guarded updates, and station/time indexes. Target at-least-once delivery with exactly-once logical effects for tested projections; this requires distributed integration and failure tests beyond the local demo.
 
-Keep source credentials in server-side environment/secrets configuration. React accesses FastAPI rather than database credentials. Production raw archives and shared model artifacts belong in object storage; local outputs need ignore rules before use.
+Run the assessed services on kind with persistent volumes. Spark runs directly on Kubernetes. The detailed design specifies the node layout, HDFS replication, streaming query separation, batch publication, and recovery scenarios.

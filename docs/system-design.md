@@ -1,8 +1,8 @@
 # Urban Air Quality System — Detailed Design Plan
 
-Status: agreed design; implementation remains pending.
+Status: agreed design; a local hourly PM2.5 replay and regression tests are implemented. Source feasibility and distributed components remain pending.
 
-This document records the detailed design agreed for the milestone project. It supersedes the preliminary technology choices in the earlier architecture, data-contract, and implementation notes. Those documents will be reconciled with this design as implementation begins.
+This document records the detailed design agreed for the milestone project. It supersedes the preliminary technology choices; the architecture, data-contract, and implementation notes now follow this stack and describe the first executable local slice.
 
 ## 1. Architecture and objectives
 
@@ -235,7 +235,7 @@ Use a compatible Spark/Scala dependency set. A concrete baseline is Spark 3.5.8,
 
 | Milestone | Deliverable and completion condition |
 | --- | --- |
-| 1. Design and source feasibility | Expand the architecture, contracts, and implementation documentation; record selected sensors, cadence, history, and API access. |
+| 1. Executable rules and source feasibility | Run a local fixture through validation, revision selection, and hourly aggregation with regression checks; record selected real sensors, cadence, history, and API access. The local replay is implemented; source feasibility remains pending. |
 | 2. Kubernetes infrastructure | Kafka, HDFS, MongoDB, and Spark start reproducibly; two executors process tasks and HDFS reports three replicas. |
 | 3. Ingestion and archive | Both sources reach Kafka; progress survives collector restarts; archived records retain provenance and support replay. |
 | 4. Monitoring path | Speed processing, FastAPI, and React show concentrations, history, missing data, and freshness. |

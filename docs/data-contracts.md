@@ -1,74 +1,95 @@
-# Proposed data contracts
+# Data contracts
 
-These are design notes, not implemented JSON schemas or SQL. Finalize types, required fields, indexes, and table engines in phase 1–2.
+The [system design](system-design.md) defines the target Kafka/HDFS/MongoDB contracts. This document distinguishes the first implemented internal measurement envelope from storage and interfaces still awaiting implementation.
 
-## Kafka topics
+## Implemented local PM2.5 envelope
 
-| Topic | Content | Proposed partition key |
+`streaming/measurements.py` parses one JSON object per nonblank line. The example is **synthetic internal data**, not an OpenAQ API response. A real collector adapter must map source semantics and preserve the original provider object.
+
+```json
+{
+  "schema_version": 1,
+  "source": "demo",
+  "station_id": "demo:station-1",
+  "sensor_id": "sensor-1",
+  "pollutant": "pm25",
+  "period_start": "2026-01-01T00:00:00Z",
+  "period_end": "2026-01-01T01:00:00Z",
+  "collected_at": "2026-01-01T01:05:00Z",
+  "ingested_at": "2026-01-01T01:06:00Z",
+  "value": 40,
+  "unit": "ug/m3",
+  "source_flags": [],
+  "provider_payload": {"value": 40, "synthetic": true}
+}
+```
+
+All shown fields are required. Station IDs start with `source:`; sensor IDs are interpreted within the source/station. Values must be finite numbers or null; zero is a valid value. Timestamps must carry a timezone and are normalized to UTC for identities and hourly output. The initial contract requires `period_start < period_end <= collected_at <= ingested_at`.
+
+### Identity and revisions
+
+- `event_id`: SHA-256 of canonical JSON containing source, station, sensor, pollutant, and UTC-normalized period start/end. The interval is half-open `[start, end)`.
+- `revision_hash`: SHA-256 of canonical JSON containing those identity fields plus original value, unit, source flags, and provider payload. Delivery timestamps are excluded.
+- Canonical JSON sorts object keys, uses compact separators, and rejects nonfinite numbers. Numeric/string representations within source payloads remain significant; adapters must preserve consistent types.
+- The current observation is the revision with greatest `(collected_at, revision_hash)`. The hash breaks equal-time ties deterministically; it does not establish upstream chronology. An ingestion-time tie-break selects the representative delivery of an otherwise identical current revision.
+- The local prototype uses the collection-time fallback only. Providers with ordered revision metadata need an adapter/ordering extension before production use.
+- Replays retain original collection metadata. Every distinct revision remains in the report; repeated delivery does not add a revision or another aggregate contribution.
+
+The report retains one representative raw envelope per revision (greatest collection/ingestion times), rather than every delivery. The input file remains the full raw source for this demo. Future HDFS archival must retain **every Kafka record** with its partition/offset metadata.
+
+### Quality and hourly output
+
+Supported mass units are `ug/m3`, `µg/m³`, `μg/m³`, and `mg/m3`. Normalized output uses `ug/m3`; milligrams are multiplied by 1,000. No gas-unit conversions are attempted.
+
+Readings remain visible with quality flags for null or negative values, unsupported units, nonfinite converted concentrations, nonempty source flags, or unsupported reporting periods. Only UTC-aligned, exactly one-hour source periods enter the initial aggregation. Unrecognized source flags are conservatively treated as unusable until a provider-specific policy exists. Structural errors are reported with the original input line.
+
+Resolve revisions **before** filtering unusable observations. A newer invalid reading removes the old value from hourly results. For each station/hour, calculate the arithmetic mean of usable current hourly sensor readings and report `sample_count`, units, and `status: provisional`. Multiple sensors are weighted equally. Hours with no usable readings have no aggregate row; missing/invalid observations remain visible in `current_measurements`.
+
+`sample_count` is not completeness. Expected cadence, coverage thresholds, subhourly/overlapping periods, and AQI require further rules after real sensors are selected. Raw invalid values remain preserved; normalized negative values are flagged and never aggregated.
+
+### Replay report
+
+`python3 -m streaming.replay data/sample_measurements.jsonl` writes a JSON report with:
+
+- `summary`: delivery, rejection, distinct revision, duplicate, current, and usable counts.
+- `hourly_metrics`: sorted provisional station/hour results.
+- `current_measurements`: selected revisions, normalized values, quality flags, and original envelopes.
+- `measurement_revisions`: distinct revisions and original envelopes.
+- `rejected_records`: line number, error reason, and original text for structurally invalid input.
+
+The CLI completes successfully when individual records are rejected: inspect `summary.rejected_records` and the detailed rejection list. An unreadable input file fails the command. Processing is bounded and in memory; this is a local correctness tool, not a persistent stream processor.
+
+## Target Kafka and HDFS contracts — pending
+
+| Topic | Event | Partition key |
 | --- | --- | --- |
-| `air_quality_raw` | Original OpenAQ measurement payload plus provenance envelope. | Stable source-qualified station ID |
-| `weather_raw` | Original Open-Meteo payload plus requested coordinates and provenance envelope. | Stable weather-location key |
+| `air_quality_raw` | One source sensor measurement, with period, original payload, identities, revisions, quality, and collection/ingestion metadata. | Source-qualified station ID |
+| `weather_raw` | One location/valid-hour record, with model provenance, fetch vintage, and issue time when supplied (recorded availability otherwise). | Weather location key |
 
-Topic partition counts and retention depend on station volume and recovery requirements. Both streaming and archival use their own consumer groups.
+Start with three partitions per topic and seven-day retention, with one replica for the local broker. Weather location mappings remain separate from station identities. The weather schema is not yet implemented.
 
-Proposed common envelope:
+Raw HDFS records retain Kafka topic, partition, offset, broker timestamp, original bytes, and provenance, including malformed events. Partition raw data by source/ingestion date, curated Parquet by observation date, and keep checkpoints, versioned features/models, and benchmarks separate.
 
-| Field | Meaning |Kubernetes
+## Target MongoDB collections — pending
+
+Use regular collections with explicit deterministic keys and station/time indexes. A logical key alone does not implement retry-safe writes: guarded updates and failure tests are required.
+
+| Collection | Logical identity/purpose |
 | --- | --- |
-| `schema_version` | Contract version for parsing and migration. |
-| `event_id` | Stable identity derived from source keys, valid time, and variable/type; record revisions separately. |
-| `source` | Provider name and endpoint/dataset provenance. |
-| `station_id` / `location_key` | Source-qualified station identity or coordinate-based weather identity. |
-| `event_time` | Observation time for measurements or valid time for weather; UTC with timezone. |
-| `ingested_at` | Time the collector received the payload; UTC with timezone. |
-| `issued_at` / `available_at` | Weather forecast issue time and known availability time where supplied/recorded. |
-| `source_revision` | Upstream revision/version when available; otherwise a documented payload-hash policy. |
-| `payload` | Original provider response or measurement record, retaining units and quality metadata. |
+| `stations` | Source-qualified station metadata, coordinates, sensors, cadence, and attribution. |
+| `measurement_revisions` | Observation ID plus payload revision hash. |
+| `current_measurements` | Observation ID, with guarded revision replacement. |
+| `weather_vintages` | Location, valid hour, model, availability/issue vintage, and revision. |
+| `speed_hourly_views` | Station/pollutant/hour, quality, coverage, and latest processed input metadata. |
+| `batch_hourly_views` | Generation plus station/pollutant/hour and committed archive cutoff. |
+| `predictions` | Station/pollutant/origin/horizon/model version. |
+| `graph_results` | Versioned station relationships, paired sample counts, and components. |
+| `control` | Collector/processing progress and publication state. |
 
-One air-quality event should represent one sensor measurement. A weather event may carry one valid hour or a response containing multiple hours; choose one representation before schema implementation. Preserve source payloads and document the deterministic normalized-row identity in either case.
+Publish a batch generation only after all writes/checks succeed. Serve a batch key when it covers that key's latest processed input, otherwise its speed view. Retain serving provenance in API results.
 
-Stable event identity alone cannot distinguish all upstream corrections. Define how revised values supersede earlier rows without losing their archived history.
+## Forecasts and API — pending
 
-## ClickHouse tables
+Forecasts contain origin, target time, horizon `1..24`, concentration/unit, model/feature version, generated time, and input freshness. Features must be available at the forecast origin. Use chronological evaluation with the documented temporal gaps; do not use realized future weather as historical forecast input. Predictions may be missing when freshness or coverage is insufficient.
 
-| Table | Proposed logical row | Key information |
-| --- | --- | --- |
-| `stations` | One station metadata record/version. | Source station ID, name, coordinates, city, timezone, sensor/pollutant coverage, updated time. |
-| `measurements` | One sensor/pollutant observation and revision. | Event ID, station, sensor, pollutant, observation/ingestion time, original and normalized value/unit, quality flags. |
-| `weather` | One location and valid time per weather kind/issue/revision. | Coordinates, observation/forecast kind, valid time, issue/availability time, temperature, humidity, wind, precipitation, pressure, units. |
-| `hourly_metrics` | One station/pollutant/hour and aggregation version. | UTC hour, concentration summary, count, expected coverage, completeness, AQI/sub-index where valid, standard version, processing time. |
-| `predictions` | One station/pollutant/origin/horizon/model version. | Origin, target time, horizon 1–24 hours, predicted concentration/unit, model version, feature version, generated time, input freshness/status. |
-
-These are logical identities, not an assumption that ClickHouse enforces unique keys. Choose engines, revision ordering, insert deduplication, and latest-row query behavior explicitly, including repeated streaming batches.
-
-Weather can be shared by several stations. Maintain a documented coordinate/location mapping; do not assume a provider's location ID equals an OpenAQ station ID. Retain forecast vintages rather than overwriting them when they are used for backtesting.
-
-## Time, units, quality, and AQI
-
-- Store UTC timestamps and use the station timezone only for presentation and deliberately defined calendar features.
-- Retain source units. Define pollutant-specific conversion rules; conversions requiring physical assumptions must record those assumptions. Unknown units are quarantined.
-- Distinguish missing data from zero. Store coverage and quality flags for aggregates; define minimum coverage before considering an aggregate usable.
-- Compute AQI only under an explicitly selected standard/version, using its required pollutant units and averaging periods. Longer-period calculations require sufficient preceding history.
-- If a station-wide AQI is derived from pollutant sub-indices, retain the contributing pollutants, missing coverage, and dominant pollutant. Display unsupported or incomplete results explicitly.
-
-## ML features and forecast contract
-
-Candidate features include lagged pollution, past rolling summaries, lagged weather, hour/day calendar variables, and station metadata. Keep a versioned feature specification shared by training and inference.
-
-For forecast origin `t`, features must be available at `t`; targets are concentrations at `t + h` for configured horizons `h = 1..24`. Completed observations or aggregates published after `t` cannot be used as inputs for a backtest at `t`. Future-weather features must come from a forecast vintage available at `t`, not realized future weather. A past-only weather model is the initial alternative if such vintages are unavailable.
-
-Store concentration forecasts first. Derived AQI forecasts need the same averaging/history and coverage checks as monitored AQI. Prediction intervals are optional later work and must be labeled and evaluated if added.
-
-## Planned API surface
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /health` | Service liveness. |
-| `GET /ready` | Serving dependency readiness. |
-| `GET /api/v1/stations` | Station inventory and available pollutant coverage. |
-| `GET /api/v1/stations/{station_id}/latest` | Latest usable readings, available AQI, quality, and freshness. |
-| `GET /api/v1/stations/{station_id}/history` | Bounded time range of measurements or hourly metrics. |
-| `GET /api/v1/stations/{station_id}/weather` | Weather mapped to the station and requested time range. |
-| `GET /api/v1/stations/{station_id}/predictions` | Forecast origin, horizon values, model metadata, and stale/missing status. |
-
-Define range limits, pollutant filters, pagination, error envelopes, and forecast-selection rules before implementation. All responses should expose units and timestamps; stale or absent data must not be presented as current readings.
+Implement the [system design's API routes](system-design.md#api-and-dashboard-interfaces): liveness/readiness, stations, latest measurements, bounded history, weather, predictions, station-network analytics, and pipeline status. History defaults to 24 hours, permits at most 90 days, and uses cursor pagination capped at 1,000 rows. All responses expose UTC timestamps, units, missing values, quality, and freshness. AQI is deferred.

@@ -1,46 +1,51 @@
-# Simple implementation plan
+# Implementation plan
 
-## First working version
+The [detailed system design](system-design.md) defines the agreed stack: Kafka, PySpark on Kubernetes, HDFS, MongoDB, Spark MLlib, GraphFrames, FastAPI, and React. Use kind for local deployment. PM2.5 monitoring comes first; AQI is deferred.
 
-Start with one city, a few active stations, and PM2.5 monitoring and forecasting. Keep the other pollutants in the event design and add them as source coverage allows. Use MinIO locally, Docker Compose for infrastructure, XGBoost after a persistence baseline, and one dashboard technology initially.
+## Start coding during milestone 1
 
-The goal is one complete path: collect data → Kafka → Spark → ClickHouse → FastAPI → dashboard. Add raw archiving and forecasting to this path in small steps.
+Infrastructure does not need to block the first executable code. Start with a small local replay that makes the measurement contract and correction rules reviewable, while source feasibility is investigated.
 
-## Implementation steps
+**Implemented:** `streaming/measurements.py` and `streaming/replay.py` provide a standard-library-only hourly PM2.5 processing path. Run from the repository root:
 
-| Step | Folder | Work | Done when |
-| --- | --- | --- | --- |
-| 1. Agree settings and start infrastructure | `config/`, `infra/` | Choose stations, units, AQI standard, polling cadence, and event keys. Add Compose for Kafka, Spark, ClickHouse, and MinIO, plus topics, buckets, and table SQL. | Services start and simple publish/read/write checks pass. |
-| 2. Collect and archive | `collectors/` | Add OpenAQ and Open-Meteo polling with pagination, retries, and durable progress. Add an independent Kafka consumer that archives raw events to MinIO. | Both topics receive events and the archive contains replayable data. |
-| 3. Process and store | `streaming/` | Add one Spark job for validation, unit normalization, deduplication, hourly aggregation, supported AQI, and ClickHouse writes. | Sample events produce expected rows; duplicate and late events have defined behavior. |
-| 4. Serve monitoring data | `api/`, `dashboard/` | Add latest readings, station history, and weather endpoints. Build one dashboard showing station selection, charts, and data freshness. | A user can inspect current and historical data for a station. |
-| 5. Add forecasting | `ml/` | Prepare chronological datasets and lag features. Evaluate persistence and XGBoost, run hourly inference for horizons 1–24, and write predictions to ClickHouse. Extend the API and dashboard. | Forecasts are visible and MAE/RMSE are reported by horizon against the baseline. |
-| 6. Verify and document | `tests/`, `docs/` | Check the complete flow, restart/retry behavior, raw replay, missing data, and stale forecasts. Document setup and demo steps. | The project can be started and demonstrated from written instructions. |
+```sh
+python3 -m streaming.replay data/sample_measurements.jsonl
+python3 -m unittest discover -s tests -v
+```
 
-Write relevant checks as each component is implemented. API/dashboard work may use fixtures before ingestion is complete; ML training needs sufficient historical data first.
+It validates records, preserves original payloads, derives stable observation/revision identities, normalizes supported mass units, resolves revisions, and recomputes station/hour means. Tests cover repeated deliveries, corrections, replay order, invalid corrections, missing values, zero, unsupported units, and source flags.
 
-## Keep implementation small
+This slice accepts only UTC-aligned one-hour source periods for aggregation. It does not estimate coverage, calculate AQI, or prove distributed delivery guarantees. Its synthetic fixture is separate from future real historical data. Use its tests and contract as the reference when implementing Spark processing; verify equivalent results from Spark.
 
-- Use a few files inside each component folder; avoid extra service layers and shared-library packages initially.
-- Keep configuration in `config/` and deployment files in `infra/`. Use environment variables for secrets.
-- Put polling and archiving entry points together in `collectors/`, but run the archive consumer independently.
-- Keep training, evaluation, and prediction code in `ml/`; use one feature-preparation implementation for training and inference.
-- Choose React or Grafana for the first dashboard. Add the other only if needed.
-- Add LightGBM, LSTM/TCN, extra cities, and complex orchestration after the first complete version works.
+**Still required for milestone 1:** select the pilot city and real sensors, verify access/cadence/history, implement a source feasibility report and source-to-envelope adapter, and adapt the processing policy if selected sensors use other reporting intervals. No real station selection or API access has been validated yet.
+
+## Delivery sequence
+
+| Milestone | Work | Done when |
+| --- | --- | --- |
+| 1. Executable rules and source feasibility | Keep the local replay runnable; add real station/sensor discovery, configuration, an OpenAQ adapter, and a source coverage report. | Demo/tests pass, selected sensors and reporting periods are documented, and real payloads can be converted to the internal envelope. |
+| 2. Kubernetes infrastructure | Add kind configuration and manifests for Kafka, HDFS, MongoDB, and Spark, with persistent storage and required indexes/topics. | Two Spark executors process tasks; HDFS reports three replicas; Kafka publish/read and MongoDB read/write checks pass. |
+| 3. Ingestion and archive | Implement independent OpenAQ and Open-Meteo polling, pagination, retries, shared request budgets, and durable progress; archive Kafka records to HDFS. | Both topics receive data, progress survives restarts, and immutable archives retain broker coordinates and provenance for replay. |
+| 4. Monitoring path | Port/verify the local rules in Spark speed processing; add deterministic MongoDB writes, FastAPI, and an initial React view. | Concentrations, history, quality, missing data, and freshness are visible; duplicates and corrections have tested effects. |
+| 5. Batch serving | Rebuild history from a committed archive snapshot; publish versioned batch results and implement per-key speed/batch selection. | Corrected history is published safely; failed publication preserves the previous generation; serving does not duplicate hours. |
+| 6. Advanced analytics | Add Spark analytics evidence, MLlib forecasting against persistence, and GraphFrames station relationships. | Required techniques execute with saved evidence; chronological forecast metrics and graph outputs are available through the API. |
+| 7. Assessment package | Document startup, benchmark runs, recovery demonstrations, and limitations. | The project can be reproduced and demonstrated from written instructions. |
+
+## Other coding that can start early
+
+- **Source discovery CLI:** report candidate sensors, cadence, available history, and missing coverage before investing in ingestion.
+- **MongoDB keys/index definitions and Kafka topic configuration:** turn documented storage identities into deployment artifacts for milestone 2.
+- **API and React prototypes using explicitly labeled fixtures:** work can proceed before live ingestion, provided readiness and missing-data behavior remain honest.
+
+Prefer the source discovery CLI next: station cadence and real payloads determine which collection and aggregation rules are needed.
 
 ## Essential correctness checks
 
-- Preserve original payloads, source units, event IDs, observation times, and ingestion times.
-- Expect repeated delivery; test retry-safe database/archive writes and processing recovery.
-- Record the selected AQI standard and required averaging periods. Display unavailable AQI when coverage is insufficient.
-- Use chronological evaluation. Features must have been available at the forecast origin; future weather features require the appropriate forecast vintage.
-- Show source freshness separately from processing delay. API polling cannot make delayed upstream observations instantaneous.
-- Keep raw archives in MinIO/S3. Use `data/` for small local samples and outputs, with ignore rules before generating large or sensitive files.
+- Preserve source payloads, units, observation periods, identities, revisions, collection times, and ingestion times.
+- Expect repeated delivery. Test retry-safe projections, stale revision rejection, corrections that invalidate earlier readings, and recovery after partial writes.
+- Keep every raw Kafka record in HDFS, including invalid input; give each streaming query its own checkpoint.
+- Reconcile speed and batch results using committed offsets and per-key input coverage. Publish a batch generation only after all checks succeed.
+- Use chronological model evaluation and recorded availability where known. Keep generated performance workloads separate from real training/evaluation data.
+- Show source freshness separately from processing delay. Retain missing values as null and quality failures explicitly.
 
-## Source references
-
-OpenAQ documents API v3, sensor measurement endpoints, API-key authentication, and rate limits. Use these references when implementing the collector: [API overview](https://docs.openaq.org/about/about), [measurements](https://docs.openaq.org/resources/measurements), [API keys](https://docs.openaq.org/using-the-api/api-key), [rate limits](https://docs.openaq.org/using-the-api/rate-limits).
-
-Open-Meteo provides coordinate-based weather model output. Preserve its provenance and distinguish historical weather from forecast inputs available at prediction time: [weather API](https://open-meteo.com/en/docs), [historical forecast API](https://open-meteo.com/en/docs/historical-forecast-api).
-
-All implementation steps remain pending; this repository is a scaffold.
+The [system design](system-design.md) contains the complete rubric, deployment sizing assumptions, source references, and assessment verification scenarios. Only the local replay is implemented so far.
