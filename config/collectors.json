@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "scope": "global",
+  "openaq": {
+    "page_size": 1000,
+    "catalog_interval_seconds": 86400,
+    "latest_interval_seconds": 3600,
+    "latest_lookback_hours": 168,
+    "reconcile_interval_seconds": 21600,
+    "worker_count": 2,
+    "bootstrap_hours": 24,
+    "lookback_hours": 48,
+    "window_hours": 24,
+    "history_days": 90
+  },
+  "weather": {
+    "enabled": true,
+    "poll_seconds": 3600,
+    "worker_count": 1,
+    "coordinate_precision": 2,
+    "model": "gfs_seamless",
+    "past_days": 2,
+    "forecast_days": 2,
+    "locations": []
+  },
+  "scheduler": {
+    "idle_seconds": 5,
+    "lease_seconds": 120,
+    "retry_seconds": 60
+  }
+}

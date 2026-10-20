@@ -4,6 +4,10 @@ services:
   mongodb:
     image: mongo:8.0
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - "127.0.0.1:${MONGO_PORT:-27017}:27017"
     volumes:
@@ -17,7 +21,7 @@ services:
 
   kafka:
     image: apache/kafka:3.9.1
-    profiles: ["kafka"]
+    profiles: ["kafka", "collectors"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:9092:9092"
@@ -48,7 +52,7 @@ services:
 
   kafka-init:
     image: apache/kafka:3.9.1
-    profiles: ["kafka"]
+    profiles: ["kafka", "collectors"]
     depends_on:
       kafka:
         condition: service_healthy
@@ -57,6 +61,30 @@ services:
       - |
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic air_quality_raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic weather_raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic air_quality_latest --partitions 3 --replication-factor 1 --config retention.ms=604800000
+
+  crawler:
+    build: .
+    profiles: ["collectors"]
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./config/collectors.json:/app/config/collectors.json:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "python", "-c", "from database import MongoDB; db=MongoDB(); assert db.ping(); db.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   mongodb_data:
