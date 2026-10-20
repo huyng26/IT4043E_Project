@@ -36,7 +36,34 @@ The replay validates hourly PM2.5 events, normalizes units, resolves duplicate d
 | `demo:station-1` | 01:00 | 35 |
 | `demo:station-2` | 00:00 | 0 |
 
-The JSON output also retains original records, revision history, quality failures, and malformed input lines. See the [implemented input contract](docs/data-contracts.md). This is a bounded, in-memory correctness demo; Kafka, Spark, HDFS, MongoDB, collectors, and the API are still pending. The fixture is unsuitable for real monitoring, training, or evaluation.
+The JSON output also retains original records, revision history, quality failures, and malformed input lines. See the [implemented input contract](docs/data-contracts.md). This is a bounded, in-memory correctness demo. The fixture is unsuitable for real monitoring, training, or evaluation.
+
+## Collect source data globally
+
+The crawler discovers **all OpenAQ locations and parameters**, including stations
+with unknown city names. MongoDB schema v2 separates catalog, measurements,
+revisions, fast latest snapshots, weather vintages and durable crawler jobs.
+`database.MongoDB` provides the dedicated read/write API.
+
+Put `OPENAQ_API_KEY` in `.env`, then start the continuous Docker deployment:
+
+```sh
+if [ ! -f .env ]; then cp .env.example .env; fi
+docker compose --profile collectors up -d --build --wait
+docker compose logs -f crawler
+```
+
+The service refreshes the global inventory daily, checks recent latest snapshots
+hourly, triggers detail queries for changes, and reconciles sensor history in
+bounded windows. Weather and Kafka publication run independently. MongoDB-backed
+leases, checkpoints, revisions and shared API budgets support restart recovery.
+Provider quotas can lengthen global refresh cycles; the status command exposes
+backlogs rather than promising every station updates within an hour.
+
+See [operation and API limits](docs/collectors.md), [MongoDB schema and Python
+reads](docs/mongodb-schema.md), and [live verification](docs/source-feasibility.md).
+Spark/HDFS, hourly serving views, the API/dashboard and the assessed Kubernetes
+deployment remain pending.
 
 Keep small samples in `data/`; store credentials, generated models, checkpoints, and large datasets outside Git. Generated local results belong in the ignored `data/outputs/` directory.
 

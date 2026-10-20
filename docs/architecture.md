@@ -10,13 +10,33 @@ Synthetic JSONL fixture → validation and normalization → revision selection 
 
 `python3 -m streaming.replay data/sample_measurements.jsonl` runs this path without infrastructure. `streaming/measurements.py` contains the initial hourly PM2.5 rules; `streaming/replay.py` handles bounded replay and reporting. These rules and their tests provide a reference for subsequent Spark implementations. The local path has no durable state and does not demonstrate cluster operation or distributed write guarantees.
 
+## Implemented collector path
+
+```text
+OpenAQ / Open-Meteo → MongoDB captured responses → durable outbox → Kafka
+```
+
+Docker Compose starts MongoDB first; its optional Kafka profile initializes both
+raw topics. Collectors discover stationary PM2.5 sensors, report source coverage,
+preserve payloads, and poll independently. MongoDB persists request budgets,
+completed windows, and recoverable captured responses. Outbox publication waits
+for Kafka acknowledgement; consumers must resolve repeat deliveries/revisions.
+
+The collector now covers the complete global OpenAQ catalog and all returned
+parameters. `database.MongoDB` owns storage and bounded reads; persistent leased
+jobs coordinate daily discovery, hourly latest sweeps, triggered detail queries
+and background reconciliation. Latest snapshots are separate from interval facts.
+See [collection operations](collectors.md), [schema](mongodb-schema.md) and
+[source status](source-feasibility.md). HDFS, hourly serving views and the assessed
+kind deployment remain pending.
+
 ## Target data flow
 
 ```mermaid
 flowchart TD
     OA[OpenAQ] --> COL[Python collectors]
     OM[Open-Meteo] --> COL
-    COL --> K[Kafka: air_quality_raw and weather_raw]
+    COL --> K[Kafka: air_quality_raw, weather_raw, air_quality_latest]
     K --> AR[Spark raw archive query]
     AR --> H[HDFS immutable raw history]
     K --> SP[Spark speed processing]

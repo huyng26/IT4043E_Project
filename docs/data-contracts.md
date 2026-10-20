@@ -1,10 +1,13 @@
 # Data contracts
 
-The [system design](system-design.md) defines the target Kafka/HDFS/MongoDB contracts. This document distinguishes the first implemented internal measurement envelope from storage and interfaces still awaiting implementation.
+The [system design](system-design.md) defines the target Kafka/HDFS/MongoDB contracts. This document distinguishes implemented replay/collector envelopes and staging from processing and serving interfaces still awaiting implementation.
 
 ## Implemented local PM2.5 envelope
 
-`streaming/measurements.py` parses one JSON object per nonblank line. The example is **synthetic internal data**, not an OpenAQ API response. A real collector adapter must map source semantics and preserve the original provider object.
+`streaming/measurements.py` parses internal PM2.5 envelopes; `streaming/replay.py`
+reads one JSON object per nonblank line. The example below is **synthetic internal
+data**, not an OpenAQ response. `collectors/openaq.py` maps provider measurements
+into this contract, preserving their original objects and reporting periods.
 
 ```json
 {
@@ -59,32 +62,78 @@ Resolve revisions **before** filtering unusable observations. A newer invalid re
 
 The CLI completes successfully when individual records are rejected: inspect `summary.rejected_records` and the detailed rejection list. An unreadable input file fails the command. Processing is bounded and in memory; this is a local correctness tool, not a persistent stream processor.
 
-## Target Kafka and HDFS contracts — pending
+## Implemented collector envelopes and MongoDB staging
+
+OpenAQ emits the PM2.5 envelope above with `source: openaq`,
+`station_id: openaq:<location_id>`, a string sensor ID, computed `event_id` and
+`revision_hash`, and a full-response reference `raw_response_id`. All returned
+OpenAQ parameters are collected; PM2.5 keeps the established processing policy.
+Inline flags are retained and conservatively mapped into `source_flags`. Structurally invalid
+measurements become rejected envelopes with `status`, `error`, original
+`provider_payload`, and collection/ingestion metadata.
+
+Weather envelopes use schema version 1 and `source: open-meteo`, with:
+
+- `location_id`, associated `station_ids`, `valid_time`, and explicit `model`.
+- `data_kind: modeled_weather`, requested coordinates and provider grid metadata.
+- `values`, per-variable `units`, and explicit flags for null values.
+- `issue_time: null`, `available_at`, and `availability_basis: recorded_fetch_time`.
+- Collection/ingestion timestamps, original per-hour payload, and full-response reference.
+- `event_id` from source/location/hour/model; `revision_hash` from values, units
+  and payload; `vintage_id` additionally includes fetch availability.
+
+Fetch availability does not prove when a historical value was originally
+published. Malformed weather responses become rejected envelopes without
+advancing successful weather progress.
+
+| Collector collection | Identity/purpose |
+| --- | --- |
+| `stations` | Source-qualified location ID; global discovery metadata and attribution, with nullable locality and GeoJSON coordinates. |
+| `sensors` | Source-qualified sensor ID; station association and metadata. |
+| `raw_responses` | Request UUID; response text, safe response headers, query parameters, original collection timestamp, and recoverable ingestion context. |
+| `collector_outbox` | Hash of request ID and row index; original envelope, topic/key, pending state, and acknowledged broker coordinates. |
+| `api_budgets` | Provider plus hashed API-key scope; atomic rolling reservations and shared deferrals. |
+| `control` | Completed source windows and catalog generations. |
+| `collector_jobs` | Persistent schedule, source/kind, progress, leases, generation triggers and retry state. |
+
+Responses are journaled before adaptation; incomplete responses can be restaged
+with original collection provenance. A completed window means all pages/outbox
+writes succeeded, not source completeness. Separate fetches remain separate
+deliveries. Broker acknowledgement precedes marking a row published, so crashes
+can produce repeat deliveries. This staging does not implement serving views or
+replace HDFS archival. See [operations](collectors.md).
+
+## Kafka contracts implemented; HDFS archival pending
 
 | Topic | Event | Partition key |
 | --- | --- | --- |
 | `air_quality_raw` | One source sensor measurement, with period, original payload, identities, revisions, quality, and collection/ingestion metadata. | Source-qualified station ID |
 | `weather_raw` | One location/valid-hour record, with model provenance, fetch vintage, and issue time when supplied (recorded availability otherwise). | Weather location key |
+| `air_quality_latest` | Explicit source snapshot with observed time and value; no invented reporting period. | Source-qualified station ID |
 
-Start with three partitions per topic and seven-day retention, with one replica for the local broker. Weather location mappings remain separate from station identities. The weather schema is not yet implemented.
+The optional Docker Kafka/collectors profiles create three partitions per topic and seven-day
+retention, with one replica. Weather location mappings remain separate from station
+identities. Rejected source records stay on their corresponding raw topic.
 
 Raw HDFS records retain Kafka topic, partition, offset, broker timestamp, original bytes, and provenance, including malformed events. Partition raw data by source/ingestion date, curated Parquet by observation date, and keep checkpoints, versioned features/models, and benchmarks separate.
 
-## Target MongoDB collections — pending
+## MongoDB source facts implemented; hourly serving pending
 
-Use regular collections with explicit deterministic keys and station/time indexes. A logical key alone does not implement retry-safe writes: guarded updates and failure tests are required.
+The dedicated `database.MongoDB` class now implements versioned catalog and source
+fact storage, bounded reads, schema validators and indexes. See the authoritative
+[v2 schema and repository API](mongodb-schema.md). In particular, `measurements`
+contains guarded current observation revisions, `measurement_revisions` retains
+distinct content, `latest_measurements` serves latest detailed sensor periods,
+`source_latest` contains explicit instant snapshots, and `weather_vintages` retains
+fetch availability. These source facts are separate from future hourly views.
 
-| Collection | Logical identity/purpose |
+| Processing/serving collection | Pending purpose |
 | --- | --- |
-| `stations` | Source-qualified station metadata, coordinates, sensors, cadence, and attribution. |
-| `measurement_revisions` | Observation ID plus payload revision hash. |
-| `current_measurements` | Observation ID, with guarded revision replacement. |
-| `weather_vintages` | Location, valid hour, model, availability/issue vintage, and revision. |
-| `speed_hourly_views` | Station/pollutant/hour, quality, coverage, and latest processed input metadata. |
-| `batch_hourly_views` | Generation plus station/pollutant/hour and committed archive cutoff. |
-| `predictions` | Station/pollutant/origin/horizon/model version. |
-| `graph_results` | Versioned station relationships, paired sample counts, and components. |
-| `control` | Collector/processing progress and publication state. |
+| `speed_hourly_views` | Station/parameter/hour, quality, coverage and processed input metadata. |
+| `batch_hourly_views` | Published generation plus station/parameter/hour and archive cutoff. |
+| `predictions` | Station/parameter/origin/horizon/model version. |
+| `graph_results` | Versioned station relationships and paired sample counts. |
+| `control` publication keys | Processing/publication state beyond existing collector progress. |
 
 Publish a batch generation only after all writes/checks succeed. Serve a batch key when it covers that key's latest processed input, otherwise its speed view. Retain serving provenance in API results.
 

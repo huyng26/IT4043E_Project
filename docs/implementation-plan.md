@@ -17,7 +17,26 @@ It validates records, preserves original payloads, derives stable observation/re
 
 This slice accepts only UTC-aligned one-hour source periods for aggregation. It does not estimate coverage, calculate AQI, or prove distributed delivery guarantees. Its synthetic fixture is separate from future real historical data. Use its tests and contract as the reference when implementing Spark processing; verify equivalent results from Spark.
 
-**Still required for milestone 1:** select the pilot city and real sensors, verify access/cadence/history, implement a source feasibility report and source-to-envelope adapter, and adapt the processing policy if selected sensors use other reporting intervals. No real station selection or API access has been validated yet.
+**Collection implementation:** `collectors/` provides OpenAQ v3 discovery,
+recent coverage reporting, a source-to-envelope adapter, paginated live polling,
+and bounded historical backfill. Open-Meteo polling is independent and preserves
+model/fetch vintages. Docker Compose starts MongoDB first, with an optional Kafka
+profile. MongoDB captures responses, stages a durable outbox, shares API budgets,
+and retains cursors; publication waits for Kafka ACKs. Recovery restages incomplete
+captured responses with original provenance. See the [collection guide](collectors.md).
+
+**Scope update:** collection now discovers all OpenAQ locations and parameters,
+without a pilot-city filter or station cap. `database.MongoDB` owns schema v2,
+read/write methods and indexes. Persistent jobs provide daily global discovery,
+hourly recent-latest sweeps, detail triggers, and background reconciliation with
+shared quotas. See [schema](mongodb-schema.md) and [global operations](collectors.md).
+
+**Still required for milestone 1:** live OpenAQ/Open-Meteo access and schema writes
+are verified, but continuous usable history and cadence/quality coverage must be
+assessed from collected source periods. Global inventory progress and per-source
+backlogs remain visible; a partial scan is not evidence of complete coverage.
+The PM2.5 hourly processing policy is still limited to supported one-hour periods,
+while collection retains other parameters and periods without discarding them.
 
 ## Delivery sequence
 
@@ -37,7 +56,8 @@ This slice accepts only UTC-aligned one-hour source periods for aggregation. It 
 - **MongoDB keys/index definitions and Kafka topic configuration:** turn documented storage identities into deployment artifacts for milestone 2.
 - **API and React prototypes using explicitly labeled fixtures:** work can proceed before live ingestion, provided readiness and missing-data behavior remain honest.
 
-Prefer the source discovery CLI next: station cadence and real payloads determine which collection and aggregation rules are needed.
+Run the global discovery service and assess actual period/cadence coverage before
+extending hourly processing rules.
 
 ## Essential correctness checks
 
@@ -48,4 +68,8 @@ Prefer the source discovery CLI next: station cadence and real payloads determin
 - Use chronological model evaluation and recorded availability where known. Keep generated performance workloads separate from real training/evaluation data.
 - Show source freshness separately from processing delay. Retain missing values as null and quality failures explicitly.
 
-The [system design](system-design.md) contains the complete rubric, deployment sizing assumptions, source references, and assessment verification scenarios. Only the local replay is implemented so far.
+The [system design](system-design.md) contains the complete rubric, deployment
+sizing assumptions, source references, and assessment scenarios. Local replay and
+the collector/outbox slice are implemented. Milestone 2's kind cluster, milestone
+3's HDFS archive, and later processing/serving paths remain pending. Docker Compose
+is the collector development setup.

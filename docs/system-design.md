@@ -1,6 +1,9 @@
 # Urban Air Quality System — Detailed Design Plan
 
-Status: agreed design; a local hourly PM2.5 replay and regression tests are implemented. Source feasibility and distributed components remain pending.
+Status: agreed design; local PM2.5 replay and source collectors/outbox are implemented.
+Docker MongoDB/Kafka and live global OpenAQ/Open-Meteo ingestion are verified.
+Usable historical coverage, assessed Kubernetes deployment, and Spark/HDFS remain pending. See
+the [collector guide](collectors.md) and [source status](source-feasibility.md).
 
 This document records the detailed design agreed for the milestone project. It supersedes the preliminary technology choices; the architecture, data-contract, and implementation notes now follow this stack and describe the first executable local slice.
 
@@ -19,7 +22,7 @@ The assessed stack will be **PySpark, Kafka, HDFS, MongoDB, and Kubernetes**, wi
 Agreed defaults:
 
 - Local Kubernetes using **kind**.
-- One pilot city and 3–5 active stations, selected after checking coverage; prefer Vietnam.
+- Collect every location and parameter exposed by OpenAQ globally, including missing locality metadata. Global collection supersedes the original one-city pilot; bounded benchmark/analytics runs can still use documented subsets.
 - PM2.5 concentration monitoring and forecasting first; AQI is a later extension.
 - React dashboard using FastAPI.
 - Real historical data for analysis and model evaluation.
@@ -76,14 +79,14 @@ flowchart TD
 
 ### Collection and processing defaults
 
-- Poll air-quality measurements every **15 minutes** and weather every **hour**.
+- Refresh the global inventory daily and sweep recent per-parameter latest snapshots every **hour**. Changed snapshots trigger detailed sensor queries; reconcile sensor history every **six hours**. Poll modeled weather every **hour** subject to its daily quota. All schedules use durable leased jobs and shared request budgets; global freshness depends on quota and backlog.
 - Use an overlapping measurement lookback to detect delayed records and corrections.
 - Maintain a shared API request budget for live polling and historical backfill; honor rate-limit headers and `429` responses. OpenAQ currently documents limits of 60 requests/minute and 2,000/hour. [OpenAQ limits](https://docs.openaq.org/using-the-api/rate-limits)
 - Run the speed query every **30 seconds** and raw archiving every **60 seconds**.
 - Reconcile the latest seven days hourly; rebuild the complete configured historical period nightly.
 - Start with 90 days of usable real history and target 180 days.
 
-Select stationary sensors with known reporting intervals. OpenAQ measurements can already represent hourly averages, so processing must retain their source periods and avoid treating each poll as a new measurement. [OpenAQ measurement semantics](https://docs.openaq.org/resources/measurements)
+Collect all sensors and retain their reporting periods, even when the hourly PM2.5 processing policy cannot aggregate them. Only supported stationary hourly observations enter that initial processing path. OpenAQ measurements can already represent hourly averages; each poll must not become a new logical observation. [OpenAQ measurement semantics](https://docs.openaq.org/resources/measurements)
 
 ### Kubernetes deployment
 
@@ -107,12 +110,13 @@ HDFS replication demonstrates distributed storage across DataNode processes. Bec
 
 ### Events and storage
 
-Use two initial topics:
+Use two detailed raw topics and one explicitly typed latest-snapshot topic:
 
 | Topic | Event representation | Partition key |
 | --- | --- | --- |
 | `air_quality_raw` | One source sensor measurement, including its reporting interval. | Source-qualified station ID |
 | `weather_raw` | One location/valid-hour weather record, retaining model provenance and fetch vintage. | Weather location key |
+| `air_quality_latest` | One instant source snapshot with stable identity and revision; source period remains unknown. | Source-qualified station ID |
 
 Start with three partitions per topic, seven-day retention, and replication factor one for the local broker.
 
@@ -128,7 +132,7 @@ Use UTC internally. Keep weather location mappings separate from station identit
 
 **HDFS organization:** raw data partitioned by source and ingestion date; curated data by observation date; versioned feature/model datasets; separate checkpoint and benchmark directories. Preserve original events and revisions rather than overwriting raw history.
 
-**MongoDB collections:** stations, measurement revisions, current measurements, weather vintages, speed hourly views, batch hourly views, predictions, graph results, and control/publication state.
+**MongoDB collections:** the implemented [v2 schema](mongodb-schema.md) separates cities/locality labels, stations, sensors, measurements, measurement revisions, latest detailed observations, source latest snapshots, weather mappings/vintages, raw captures, outbox, budgets and durable jobs. Speed/batch hourly views, predictions, graph results and publication state remain later processing/serving work.
 
 Use regular MongoDB collections with deterministic keys and compound indexes for station/time queries. This supports explicit uniqueness and retry-safe updates; MongoDB time-series collections restrict unique indexes. [MongoDB limitations](https://www.mongodb.com/docs/manual/core/timeseries/timeseries-limitations/)
 
@@ -258,6 +262,6 @@ Required verification scenarios:
 
 Benchmark at **100,000, 1 million, and 5 million events** in an isolated dataset. Record dataset bytes, throughput, processing latency, shuffle volume, spill, scanned partitions, and executor memory. Generated events must never enter real model evaluation or monitoring results.
 
-The initial monitoring target is **p95 Kafka-to-serving latency below two minutes** under the controlled pilot workload. Report source publication delay separately.
+The initial monitoring target is **p95 Kafka-to-serving latency below two minutes** under a controlled documented workload subset. Report source publication delay separately.
 
 Update the existing project documentation consistently: Kubernetes becomes the assessed deployment; HDFS supplies distributed storage; MongoDB becomes the serving database; Spark MLlib supplies the initial learned model. Preserve the repository's small component structure while adding the explicit batch path and assessment evidence.
