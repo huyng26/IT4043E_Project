@@ -56,9 +56,13 @@ def replay(lines) -> dict:
     }
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="Small internal measurement JSONL file")
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="Exit with status 1 if any records are rejected; still print the report",
+    )
     args = parser.parse_args()
     try:
         with args.input.open(encoding="utf-8") as lines:
@@ -66,7 +70,8 @@ def main() -> None:
     except OSError as error:
         parser.error(str(error))
     print(json.dumps(result, indent=2, allow_nan=False))
+    return 1 if args.strict and result["summary"]["rejected_records"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
