@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 from streaming.measurements import parse_measurement
@@ -44,6 +45,39 @@ class ReplayTests(unittest.TestCase):
             "usable_observations": 3,
         })
         self.assertEqual([row["mean"] for row in result["hourly_metrics"]], [42, 35, 0])
+
+    def test_strict_cli_accepts_fixture_with_quality_flags(self):
+        process = subprocess.run(
+            [sys.executable, "-m", "streaming.replay", "--strict", str(FIXTURE)],
+            cwd=ROOT, check=True, capture_output=True, text=True,
+        )
+        result = json.loads(process.stdout)
+        self.assertEqual(result["summary"]["rejected_records"], 0)
+        self.assertGreater(
+            result["summary"]["current_observations"],
+            result["summary"]["usable_observations"],
+        )
+
+    def test_cli_rejections_only_fail_in_strict_mode_and_keep_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "measurements.jsonl"
+            path.write_text("{bad JSON\n\n" + json.dumps(event()) + "\n", encoding="utf-8")
+            reports = []
+            for options, expected_status in [([], 0), (["--strict"], 1)]:
+                with self.subTest(options=options):
+                    process = subprocess.run(
+                        [sys.executable, "-m", "streaming.replay", *options, str(path)],
+                        cwd=ROOT, capture_output=True, text=True,
+                    )
+                    self.assertEqual(process.returncode, expected_status, process.stderr)
+                    result = json.loads(process.stdout)
+                    self.assertEqual(result["summary"]["parsed_records"], 1)
+                    self.assertEqual(result["summary"]["rejected_records"], 1)
+                    self.assertEqual(result["rejected_records"][0]["line"], 1)
+                    self.assertEqual(result["rejected_records"][0]["raw_line"], "{bad JSON")
+                    self.assertEqual(result["hourly_metrics"][0]["mean"], 40)
+                    reports.append(result)
+            self.assertEqual(reports[0], reports[1])
 
     def test_correction_and_late_replay_are_order_independent(self):
         original = event()

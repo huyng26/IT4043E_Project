@@ -60,7 +60,19 @@ Resolve revisions **before** filtering unusable observations. A newer invalid re
 - `measurement_revisions`: distinct revisions and original envelopes.
 - `rejected_records`: line number, error reason, and original text for structurally invalid input.
 
-The CLI completes successfully when individual records are rejected: inspect `summary.rejected_records` and the detailed rejection list. An unreadable input file fails the command. Processing is bounded and in memory; this is a local correctness tool, not a persistent stream processor.
+By default, the CLI completes successfully when individual records are rejected:
+inspect `summary.rejected_records` and the detailed rejection list. For automated
+validation, add `--strict` to exit with status 1 when any records are rejected:
+
+```sh
+python3 -m streaming.replay --strict data/sample_measurements.jsonl
+```
+
+Strict mode still writes the complete JSON report, including valid observations
+and rejected lines. Quality-flagged observations are parsed records and do not
+cause strict mode to fail. An unreadable input file fails the command in either
+mode. Processing is bounded and in memory; this is a local correctness tool, not
+a persistent stream processor.
 
 ## Implemented collector envelopes and MongoDB staging
 
