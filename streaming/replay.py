@@ -49,7 +49,7 @@ def replay(lines) -> dict:
             "current_observations": len(current),
             "usable_observations": sum(not item.quality_flags for item in current),
         },
-        "hourly_metrics": hourly_metrics(current),
+        "hourly_metrics": [item.as_dict() for item in hourly_metrics(current)],
         "current_measurements": [item.as_dict() for item in current],
         "measurement_revisions": [revisions[key].as_dict() for key in sorted(revisions)],
         "rejected_records": rejected,
