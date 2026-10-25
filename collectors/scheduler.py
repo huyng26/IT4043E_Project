@@ -81,6 +81,7 @@ class Crawler:
         if "open-meteo" in sources and self.config["weather"]["enabled"]:
             for location in self.config["weather"].get("locations", []):
                 self.store.save_manual_weather_location(location)
+                self.store.enqueue_catalog("weather_location_metadata", location)
                 self.store.ensure_job(
                     f"weather:{location['location_id']}",
                     "open-meteo",

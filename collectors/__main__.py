@@ -12,8 +12,10 @@ from collectors.scheduler import Crawler, Lease
 from collectors.service import recover_pending
 from collectors.settings import load_settings
 from collectors.storage import Store, now
+from database import MongoDB
 from database.migrations import migrate_envelopes
-from streaming.measurements import canonical_json, digest, timestamp, utc_time
+from models import digest, timestamp, utc_time
+from streaming.kafka import KafkaManager
 
 LOGGER = logging.getLogger("collectors")
 
@@ -29,7 +31,7 @@ def parser():
     commands.add_parser("recover")
     commands.add_parser(
         "migrate",
-        help="Project existing envelopes into schema v2 without deleting raw data",
+        help="Requeue legacy serving-database input through Kafka and Spark",
     )
     discovery = commands.add_parser(
         "discover", help="Resume the complete global catalog"
@@ -69,20 +71,8 @@ def parser():
 
 
 def create_producer():
-    from kafka import KafkaProducer
-
-    return KafkaProducer(
-        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092").split(
-            ","
-        ),
-        key_serializer=lambda key: key.encode(),
-        value_serializer=lambda value: canonical_json(value).encode(),
-        acks="all",
-        retries=5,
-        max_in_flight_requests_per_connection=1,
-        request_timeout_ms=30000,
-        max_block_ms=10000,
-    )
+    """Compatibility factory; Kafka configuration lives in KafkaManager."""
+    return KafkaManager()
 
 
 def publish_once(store, limit=1000):
@@ -181,7 +171,13 @@ def main(argv=None):
         elif args.command == "recover":
             output = {"recovered_responses": recover_pending(store)}
         elif args.command == "migrate":
-            output = migrate_envelopes(store.mongodb)
+            with MongoDB() as legacy:
+                output = migrate_envelopes(
+                    legacy,
+                    store.mongodb,
+                    coordinate_precision=config["weather"]["coordinate_precision"],
+                    weather_enabled=config["weather"]["enabled"],
+                )
         elif args.command == "discover":
             if args.max_pages < 0:
                 raise ValueError("max-pages must be nonnegative")
@@ -237,16 +233,20 @@ def main(argv=None):
                 raise ValueError("limit must be 1..1000")
             output = {"published": publish_once(store, args.limit)}
         elif args.command == "cities":
-            output = store.list_cities(args.country, after=args.after, limit=args.limit)
+            with MongoDB() as serving:
+                output = serving.list_cities(
+                    args.country, after=args.after, limit=args.limit
+                )
         elif args.command == "history":
-            output = store.get_measurements(
-                args.station,
-                utc_time(args.start, "start"),
-                utc_time(args.end, "end"),
-                parameter=args.parameter,
-                cursor=args.cursor,
-                limit=args.limit,
-            )
+            with MongoDB() as serving:
+                output = serving.get_measurements(
+                    args.station,
+                    utc_time(args.start, "start"),
+                    utc_time(args.end, "end"),
+                    parameter=args.parameter,
+                    cursor=args.cursor,
+                    limit=args.limit,
+                )
         print(
             json.dumps(
                 output,

@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import timedelta
 
 from collectors.storage import now
+from models import MeasurementEvent
 from streaming.measurements import digest, parse_measurement, timestamp, utc_time
 
 BASE_URL = "https://api.openaq.org/v3"
@@ -119,7 +120,7 @@ def adapt_measurement(payload, sensor, collected_at, ingested_at=None):
         if "value" not in payload:
             raise ValueError("OpenAQ value field is missing")
         if envelope["pollutant"] == "pm25":
-            measurement = parse_measurement(envelope)
+            measurement = MeasurementEvent.from_dict(envelope)
             envelope.update(
                 event_id=measurement.event_id, revision_hash=measurement.revision_hash
             )

@@ -45,7 +45,7 @@ def stage_latest(store, response, parameter):
             observed = utc_time(payload["datetime"]["utc"], "latest.datetime")
             if observed > response.collected_at:
                 raise ValueError("latest observation is in the future")
-            changed = store.save_latest_snapshot(
+            changed = store.remember_latest_snapshot(
                 payload, parameter, response.collected_at, response.request_id
             )
             job_id = f"openaq:sensor:{payload['sensorsId']}"
@@ -127,8 +127,6 @@ def stage_measurements(store, page, sensor):
             )
             rejected += 1
         envelope["raw_response_id"] = page.request_id
-        if envelope.get("status") != "rejected":
-            store.save_measurement(envelope)
         store.enqueue(
             page, index, "air_quality_raw", f"openaq:{sensor['location_id']}", envelope
         )
@@ -153,7 +151,6 @@ def stage_weather(store, response, location, model):
         raise
     for index, envelope in enumerate(envelopes):
         envelope["raw_response_id"] = response.request_id
-        store.save_weather(envelope)
         store.enqueue(response, index, "weather_raw", location["location_id"], envelope)
     store.finish_response(response.request_id)
     return envelopes

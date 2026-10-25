@@ -95,9 +95,6 @@ def adapt_weather(response, location, model):
             },
             "values": values,
             "units": {name: units[name] for name in VARIABLES},
-            "quality_flags": [
-                f"missing:{name}" for name, value in values.items() if value is None
-            ],
             "issue_time": None,
             "available_at": timestamp(response.collected_at),
             "availability_basis": "recorded_fetch_time",

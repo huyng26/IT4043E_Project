@@ -1,6 +1,7 @@
 """Collector facade. All MongoDB queries live in database.MongoDB."""
 
 import json
+import os
 import time
 
 from database import MongoDB
@@ -19,10 +20,20 @@ def wait(seconds, stop_event=None):
 
 
 class CollectorStore:
-    """Compose persistence, retry waiting and publication outside the database class."""
+    """Collector control state and outbox, isolated from Spark's serving database."""
 
     def __init__(self, uri=None, database=None, repository=None):
-        self.mongodb = repository or MongoDB(uri, database)
+        state_database = database or os.getenv(
+            "MONGO_COLLECTOR_DATABASE",
+            os.getenv("MONGO_DATABASE", "urban_air_quality") + "_collector",
+        )
+        if repository is None and state_database == os.getenv(
+            "MONGO_DATABASE", "urban_air_quality"
+        ):
+            raise ValueError("collector state and serving databases must be different")
+        self.mongodb = (
+            repository if repository is not None else MongoDB(uri, state_database)
+        )
         self.stop_event = None
 
     def __getattr__(self, name):
@@ -60,6 +71,41 @@ class CollectorStore:
 
     def enqueue(self, response, index, topic, key, envelope):
         self.mongodb.enqueue(response.request_id, index, topic, key, envelope)
+
+    def enqueue_catalog(self, record_type, payload, **metadata):
+        collected_at = timestamp(now())
+        envelope = {
+            "schema_version": 1,
+            "source": "collector",
+            "record_type": record_type,
+            "provider_payload": payload,
+            "collected_at": collected_at,
+            "ingested_at": collected_at,
+            **metadata,
+        }
+        key = str(payload.get("id", payload.get("location_id", record_type)))
+        self.mongodb.enqueue(
+            "catalog:" + digest(envelope), 0, "source_catalog", key, envelope
+        )
+
+    def remember_latest_snapshot(self, payload, parameter, collected_at, response_id):
+        return self.mongodb.save_latest_snapshot(
+            payload, parameter, collected_at, response_id, collection="collector_latest"
+        )
+
+    def mark_latest_dispatched(self, sensor_id, payload):
+        self.mongodb.mark_latest_dispatched(
+            sensor_id, payload, collection="collector_latest"
+        )
+
+    def save_measurement(self, *_args, **_kwargs):
+        raise RuntimeError("measurement projections must be written by Spark")
+
+    def save_weather(self, *_args, **_kwargs):
+        raise RuntimeError("weather projections must be written by Spark")
+
+    def save_latest_snapshot(self, *_args, **_kwargs):
+        raise RuntimeError("serving snapshots must be written by Spark")
 
     def reserve_request(
         self, scope, minute_limit=60, hour_limit=2000, day_limit=None, units=1

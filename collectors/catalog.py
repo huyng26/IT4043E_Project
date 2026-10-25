@@ -6,6 +6,7 @@ from streaming.measurements import digest
 
 def register_parameter(store, parameter):
     store.save_parameter(parameter)
+    store.enqueue_catalog("parameter_metadata", parameter)
     store.ensure_job(
         f"openaq:latest:{parameter['id']}",
         "openaq",
@@ -17,6 +18,12 @@ def register_parameter(store, parameter):
 
 def register_station(store, payload, config, generation=None):
     station = store.save_station(payload, generation)
+    store.enqueue_catalog(
+        "station_metadata",
+        payload,
+        weather_enabled=config["weather"]["enabled"],
+        coordinate_precision=config["weather"]["coordinate_precision"],
+    )
     for sensor in payload.get("sensors", []):
         store.ensure_job(
             f"openaq:sensor:{sensor['id']}",
