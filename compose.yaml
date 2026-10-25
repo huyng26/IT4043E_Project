@@ -21,7 +21,7 @@ services:
 
   kafka:
     image: apache/kafka:3.9.1
-    profiles: ["kafka", "collectors"]
+    profiles: ["kafka", "collectors", "pipeline"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:9092:9092"
@@ -52,7 +52,7 @@ services:
 
   kafka-init:
     image: apache/kafka:3.9.1
-    profiles: ["kafka", "collectors"]
+    profiles: ["kafka", "collectors", "pipeline"]
     depends_on:
       kafka:
         condition: service_healthy
@@ -62,16 +62,19 @@ services:
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic air_quality_raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic weather_raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic air_quality_latest --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic source_catalog --partitions 3 --replication-factor 1 --config retention.ms=604800000
 
   crawler:
+    image: urban-air-quality-crawler:local
     build: .
-    profiles: ["collectors"]
+    profiles: ["collectors", "pipeline"]
     restart: unless-stopped
     init: true
     env_file: .env
     environment:
       MONGO_URI: mongodb://mongodb:27017
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      MONGO_COLLECTOR_DATABASE: ${MONGO_COLLECTOR_DATABASE:-urban_air_quality_collector}
     volumes:
       - ./config/collectors.json:/app/config/collectors.json:ro
     depends_on:
@@ -86,6 +89,31 @@ services:
       timeout: 10s
       retries: 3
 
+  spark:
+    image: urban-air-quality-spark:local
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    profiles: ["collectors", "pipeline"]
+    restart: unless-stopped
+    init: true
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: ${MONGO_DATABASE:-urban_air_quality}
+      MONGO_COLLECTOR_DATABASE: ${MONGO_COLLECTOR_DATABASE:-urban_air_quality_collector}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      STREAMING_CHECKPOINT_LOCATION: /checkpoints/mongo
+      SPARK_LOCAL_IP: 127.0.0.1
+    volumes:
+      - spark_checkpoints:/checkpoints
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    stop_grace_period: 60s
+
 volumes:
   mongodb_data:
   kafka_data:
+  spark_checkpoints:

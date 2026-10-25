@@ -12,6 +12,11 @@ collectors = [
     "python-dotenv>=1.0,<2",
     "kafka-python>=2.2,<3",
 ]
+streaming = [
+    "pymongo>=4.10,<5",
+    "python-dotenv>=1.0,<2",
+    "pyspark==3.5.8",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -19,3 +24,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["collectors*", "streaming*", "database*"]
+
+[tool.setuptools]
+py-modules = ["models"]
