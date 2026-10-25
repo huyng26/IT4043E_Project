@@ -1,8 +1,10 @@
 # Global collection and operation
 
 Collection covers **all locations and parameters returned by OpenAQ**, without a
-Hanoi/country/radius filter or a station count cap. MongoDB stores the catalog,
-source facts and durable scheduling state. See [MongoDB schema/API](mongodb-schema.md).
+Hanoi/country/radius filter or a station count cap. Collectors publish source facts
+and catalog metadata to Kafka. Spark creates MongoDB serving projections. The
+collector's separate MongoDB database stores operational state only. See
+[pipeline operation](streaming.md) and [MongoDB schema/API](mongodb-schema.md).
 
 ## Run continuously in Docker
 
@@ -11,12 +13,13 @@ Create `.env` from `.env.example` if needed and put `OPENAQ_API_KEY` in `.env`:
 ```sh
 if [ ! -f .env ]; then cp .env.example .env; fi
 docker compose --profile collectors up -d --build --wait
-docker compose logs -f crawler
+docker compose logs -f crawler spark
 ```
 
-The `collectors` profile starts MongoDB, Kafka, initializes all three topics, and
-runs the crawler with `restart: unless-stopped`, heartbeat leases, and a Kafka
-publisher. Credentials are injected at runtime and excluded from the build context.
+The `collectors` and `pipeline` profiles start MongoDB, Kafka, initialize all four
+topics, and run both the crawler and Spark with `restart: unless-stopped`. The
+crawler has heartbeat leases and a Kafka publisher. Credentials are injected at
+runtime and excluded from the build context.
 The config is mounted read-only; edit `config/collectors.json` and restart the
 crawler to apply settings. MongoDB and Kafka use persistent named volumes.
 
@@ -26,8 +29,8 @@ docker compose --profile collectors up -d   # resume durable work
 ```
 
 MongoDB is bound to `127.0.0.1:27017`, Kafka to `127.0.0.1:9092`. Containers use
-service names internally. The local database defaults to `urban_air_quality`
-without authentication. Change `MONGO_PORT` and the host `MONGO_URI` together if
+service names internally. Serving defaults to `urban_air_quality`; collector
+state defaults to `urban_air_quality_collector`, without authentication. Change `MONGO_PORT` and the host `MONGO_URI` together if
 necessary. MongoDB's file descriptor limit is explicitly 65,536 to support the
 schema/index workload; see [MongoDB ulimit guidance](https://www.mongodb.com/docs/v8.0/reference/ulimit/).
 
@@ -43,10 +46,36 @@ python3 -m venv .venv
 ```
 
 Host publication also needs `docker compose --profile kafka up -d --wait`.
+Run Spark separately with `docker compose --profile pipeline up -d --build spark`
+or the host instructions in [streaming.md](streaming.md). Publishing alone does
+not populate serving measurements/weather.
 Use one deployment configuration per database; multiple workers coordinate
 through persistent leases and shared API budgets. Do not run mixed code versions
 against the same catalog indefinitely. Environment variables override `.env`.
 `--config PATH` goes before the subcommand.
+
+Kafka producer configuration, UTF-8/JSON serialization, sending, flushing and
+connection cleanup live in `streaming.kafka.KafkaManager`. It reads
+`KAFKA_BOOTSTRAP_SERVERS` by default, or accepts a comma-separated string/list
+of brokers. The collector's `create_producer()` factory returns this manager;
+`CollectorStore.publish()` still owns outbox iteration and records delivery only
+after the returned future acknowledges the record.
+
+Other publishers can use the same class directly:
+
+```python
+from streaming.kafka import KafkaManager
+
+with KafkaManager() as kafka:
+    metadata = kafka.publish(
+        "air_quality_raw", key="openaq:10", value=envelope
+    )
+    print(metadata.topic, metadata.partition, metadata.offset)
+```
+
+`publish()` waits for an ACK and returns broker metadata; `send()` returns a
+future for asynchronous use. Delivery errors propagate to the caller. Topic
+creation remains in the Compose `kafka-init` service.
 
 ## Schedule and scope
 
@@ -85,8 +114,8 @@ instead of repeatedly querying the same first window after a restart.
 
 Initial detailed collection covers the most recent 24 hours. Subsequent cycles
 look back 48 hours from completed progress to detect corrections and fill gaps.
-A 24-hour source query window advances only after every page and durable fact/
-outbox write succeeds. Empty responses can complete a query window; completion
+A 24-hour source query window advances only after every page and durable
+outbox write succeeds. Spark tracks processing completion separately. Empty responses can complete a query window; completion
 is not evidence of usable coverage. Older history requires explicit backfill.
 
 ## Global scale and API limits
@@ -135,10 +164,11 @@ is separate from live cursors; completed fixed jobs remain inspectable.
 .venv/bin/python -m collectors status
 ```
 
-Recovery restages incomplete captured responses with original timestamps and
-request/row IDs. Migration projects existing v1 outbox facts/catalog into v2
-without deleting raw data or resetting publication acknowledgements. Both are
-retry-safe. Source facts and outbox records must finish before response staging
+Recovery restages incomplete captured responses into the collector outbox with
+original timestamps and request/row IDs. Migration reads legacy outbox/catalog
+from the serving database and queues them in the collector outbox for Kafka and
+Spark, without deleting source data or resetting original acknowledgements. Both
+are retry-safe. Outbox records must finish before response staging
 is marked complete. An ACK from Kafka precedes marking an outbox row published;
 a crash between them can repeat delivery. There is no cross-system transaction.
 

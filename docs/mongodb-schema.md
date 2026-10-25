@@ -5,6 +5,12 @@ lifetime, validators, indexes, catalog/fact writes, bounded reads, job state and
 atomic budget reservations. It does not poll APIs, sleep, schedule workers, or
 publish Kafka messages. Those responsibilities belong to `collectors/`.
 
+There are two database roles: `MONGO_COLLECTOR_DATABASE` holds collector recovery,
+outbox, quotas, jobs, `collector_latest` and scheduling catalog caches;
+`MONGO_DATABASE` holds serving facts/catalog, written only by Spark after Kafka.
+The collector CLI reads serving history through a separate repository connection.
+See [pipeline ownership and operation](streaming.md).
+
 Use regular collections. Deterministic IDs and guarded updates are necessary for
 corrections and uniqueness; MongoDB time-series collections are not used here.
 All database dates are timezone-aware UTC BSON dates. Exact collection ordering
@@ -72,13 +78,16 @@ newer. Invalid corrections, including null/negative PM2.5 values, supersede olde
 usable readings. Older-hour corrections cannot displace a later-hour latest
 reading. Repeat writes reuse keys; stale writes cannot restore an old value.
 There is no transaction spanning these three collections: interrupted projections
-are repaired by restaging the captured response or rerunning migration.
+are repaired by Spark retrying the uncommitted Kafka micro-batch. Legacy migration
+also routes input through Kafka and Spark rather than writing these projections.
 
 `source_latest` is separate because OpenAQ's latest endpoint omits reporting
 periods and can miss delayed/historical revisions. Its snapshot comparison
 detects changed values at the same observed time as well as new timestamps.
-A durable pending-dispatch flag repairs a crash between saving a change and
-requesting the detailed sensor job. Detailed facts are the source for later hourly
+A separate `collector_latest` cache in the control database has a durable
+pending-dispatch flag to repair a crash between detecting a change and requesting
+the detailed sensor job. Serving `source_latest` is written by Spark and does not
+drive crawler scheduling. Detailed facts are the source for later hourly
 processing; the fast snapshot is explicitly labeled when read.
 
 History indexes use station/parameter/end-time/ID and sensor/end-time/ID. Revisions
@@ -99,6 +108,11 @@ after the supplied origin; retrospective data must not be treated as previously
 available. Results are bounded and can contain several vintages of one valid hour.
 
 ## Ingestion and operational state
+
+The following collector collections live in the control database, not the
+serving database. Spark's serving-side `stream_rejections` retains malformed
+Kafka events by topic/partition/offset; `control/stream:<query-name>` records
+successful batch offset summaries.
 
 | Collection | Purpose |
 | --- | --- |
@@ -144,10 +158,11 @@ with MongoDB() as db:
 
 ## Migration and retention
 
-`python -m collectors migrate` projects existing outbox measurement/weather
-envelopes and legacy station metadata into v2. It preserves original timestamps,
-raw records and Kafka acknowledgement state, is repeatable, and does not delete
-old data. `recover` handles incomplete captured responses instead. Migration is
+`python -m collectors migrate` copies existing serving-database outbox envelopes
+and station metadata into pending collector outbox entries. Kafka and Spark then
+reprocess them. It preserves original timestamps, raw records and source Kafka
+acknowledgements, is repeatable, and does not delete old data.
+`recover` handles incomplete captured responses in the control database. Migration is
 an explicit maintenance command, not a full scan on every worker startup.
 
 Validation is moderate so existing v1 documents are retained during migration;

@@ -13,14 +13,18 @@ Synthetic JSONL fixture → validation and normalization → revision selection 
 ## Implemented collector path
 
 ```text
-OpenAQ / Open-Meteo → MongoDB captured responses → durable outbox → Kafka
+OpenAQ / Open-Meteo → collectors → Kafka → Spark Structured Streaming → MongoDB serving
 ```
 
-Docker Compose starts MongoDB first; its optional Kafka profile initializes both
-raw topics. Collectors discover stationary PM2.5 sensors, report source coverage,
-preserve payloads, and poll independently. MongoDB persists request budgets,
-completed windows, and recoverable captured responses. Outbox publication waits
-for Kafka acknowledgement; consumers must resolve repeat deliveries/revisions.
+The `pipeline` (or `collectors`) Compose profile runs MongoDB, Kafka, the crawler
+and Spark. Kafka has three source-data topics and a `source_catalog` metadata
+topic. The collector's separate control database retains jobs, quotas, metadata
+caches, captured responses and the outbox; these are not serving projections.
+Outbox publication waits for Kafka acknowledgement. Spark validates input on
+executor partitions and writes guarded measurement revisions, weather vintages,
+latest snapshots and catalog projections into the serving database. Durable
+checkpoints resume Kafka offsets; malformed events retain original bytes in
+`stream_rejections`. See [pipeline operation](streaming.md).
 
 The collector now covers the complete global OpenAQ catalog and all returned
 parameters. `database.MongoDB` owns storage and bounded reads; persistent leased
@@ -36,7 +40,7 @@ kind deployment remain pending.
 flowchart TD
     OA[OpenAQ] --> COL[Python collectors]
     OM[Open-Meteo] --> COL
-    COL --> K[Kafka: air_quality_raw, weather_raw, air_quality_latest]
+    COL --> K[Kafka: raw, latest and catalog topics]
     K --> AR[Spark raw archive query]
     AR --> H[HDFS immutable raw history]
     K --> SP[Spark speed processing]
@@ -65,7 +69,7 @@ Batch jobs rebuild corrected history from a fixed archive snapshot. FastAPI sele
 | --- | --- |
 | `config/` | Selected stations, cadence, polling intervals, unit/quality rules, and model settings. |
 | `collectors/` | Provider discovery, polling, adapters, and durable source progress. |
-| `streaming/` | Initial local processing rules and replay; future Spark raw archive, speed, and batch entry points. |
+| `streaming/` | Kafka manager, Spark-to-MongoDB projection pipeline and local replay; future HDFS archive, hourly speed views and batch jobs. |
 | `ml/` | Features, chronological evaluation, MLlib training/inference, and graph analysis entry points. |
 | `api/` | FastAPI endpoints, MongoDB queries, and speed/batch serving selection. |
 | `dashboard/` | React UI using FastAPI. |

@@ -22,7 +22,7 @@ recent coverage reporting, a source-to-envelope adapter, paginated live polling,
 and bounded historical backfill. Open-Meteo polling is independent and preserves
 model/fetch vintages. Docker Compose starts MongoDB first, with an optional Kafka
 profile. MongoDB captures responses, stages a durable outbox, shares API budgets,
-and retains cursors; publication waits for Kafka ACKs. Recovery restages incomplete
+and retains cursors in a separate collector-control database; publication waits for Kafka ACKs. Recovery restages incomplete
 captured responses with original provenance. See the [collection guide](collectors.md).
 
 **Scope update:** collection now discovers all OpenAQ locations and parameters,
@@ -30,6 +30,14 @@ without a pilot-city filter or station cap. `database.MongoDB` owns schema v2,
 read/write methods and indexes. Persistent jobs provide daily global discovery,
 hourly recent-latest sweeps, detail triggers, and background reconciliation with
 shared quotas. See [schema](mongodb-schema.md) and [global operations](collectors.md).
+
+**Processing boundary implemented:** collectors publish measurements, weather,
+latest snapshots and catalog metadata to Kafka. `streaming.spark` consumes them
+with Structured Streaming and writes serving MongoDB projections on executor
+partitions. Collectors no longer write serving facts. Compose runs the local
+Spark development process with persistent checkpoints; malformed events are
+retained and failed writes retry. See [pipeline operation](streaming.md).
+Hourly Spark aggregates, HDFS archival and the assessed kind deployment remain pending.
 
 **Still required for milestone 1:** live OpenAQ/Open-Meteo access and schema writes
 are verified, but continuous usable history and cadence/quality coverage must be
@@ -70,6 +78,6 @@ extending hourly processing rules.
 
 The [system design](system-design.md) contains the complete rubric, deployment
 sizing assumptions, source references, and assessment scenarios. Local replay and
-the collector/outbox slice are implemented. Milestone 2's kind cluster, milestone
+the collector/outbox slice and Kafka-to-Spark-to-MongoDB fact projections are implemented. Milestone 2's kind cluster, milestone
 3's HDFS archive, and later processing/serving paths remain pending. Docker Compose
 is the collector development setup.

@@ -1,8 +1,9 @@
 # Urban Air Quality System — Detailed Design Plan
 
-Status: agreed design; local PM2.5 replay and source collectors/outbox are implemented.
-Docker MongoDB/Kafka and live global OpenAQ/Open-Meteo ingestion are verified.
-Usable historical coverage, assessed Kubernetes deployment, and Spark/HDFS remain pending. See
+Status: agreed design; local PM2.5 replay, source collectors/outbox and the
+Kafka → Spark Structured Streaming → MongoDB fact-projection path are implemented.
+Collectors use a separate operational database; Spark owns serving projections.
+Usable historical coverage, assessed Kubernetes deployment, Spark hourly views and HDFS remain pending. See
 the [collector guide](collectors.md) and [source status](source-feasibility.md).
 
 This document records the detailed design agreed for the milestone project. It supersedes the preliminary technology choices; the architecture, data-contract, and implementation notes now follow this stack and describe the first executable local slice.
@@ -110,13 +111,15 @@ HDFS replication demonstrates distributed storage across DataNode processes. Bec
 
 ### Events and storage
 
-Use two detailed raw topics and one explicitly typed latest-snapshot topic:
+Use two detailed raw topics, one explicitly typed latest-snapshot topic and a
+catalog metadata topic:
 
 | Topic | Event representation | Partition key |
 | --- | --- | --- |
 | `air_quality_raw` | One source sensor measurement, including its reporting interval. | Source-qualified station ID |
 | `weather_raw` | One location/valid-hour weather record, retaining model provenance and fetch vintage. | Weather location key |
 | `air_quality_latest` | One instant source snapshot with stable identity and revision; source period remains unknown. | Source-qualified station ID |
+| `source_catalog` | Station/parameter metadata and weather location mapping policy. | Source entity ID |
 
 Start with three partitions per topic, seven-day retention, and replication factor one for the local broker.
 
@@ -133,6 +136,13 @@ Use UTC internally. Keep weather location mappings separate from station identit
 **HDFS organization:** raw data partitioned by source and ingestion date; curated data by observation date; versioned feature/model datasets; separate checkpoint and benchmark directories. Preserve original events and revisions rather than overwriting raw history.
 
 **MongoDB collections:** the implemented [v2 schema](mongodb-schema.md) separates cities/locality labels, stations, sensors, measurements, measurement revisions, latest detailed observations, source latest snapshots, weather mappings/vintages, raw captures, outbox, budgets and durable jobs. Speed/batch hourly views, predictions, graph results and publication state remain later processing/serving work.
+
+Collector raw captures/outbox/budgets/jobs and scheduling metadata caches live in
+`MONGO_COLLECTOR_DATABASE`; serving facts/catalog live in `MONGO_DATABASE` and
+are materialized by Spark after Kafka consumption. A `collector_latest` cache
+drives source change detection without writing serving `source_latest` snapshots.
+The Compose implementation uses local Spark with a persistent checkpoint volume;
+HDFS checkpoints and two Kubernetes executors remain the deployment target.
 
 Use regular MongoDB collections with deterministic keys and compound indexes for station/time queries. This supports explicit uniqueness and retry-safe updates; MongoDB time-series collections restrict unique indexes. [MongoDB limitations](https://www.mongodb.com/docs/manual/core/timeseries/timeseries-limitations/)
 

@@ -76,6 +76,10 @@ a persistent stream processor.
 
 ## Implemented collector envelopes and MongoDB staging
 
+Staging lives in `MONGO_COLLECTOR_DATABASE`, separate from serving MongoDB.
+Collectors only format and queue facts; Spark consumes Kafka to materialize
+serving measurement/weather/latest/catalog projections. See [pipeline operation](streaming.md).
+
 OpenAQ emits the PM2.5 envelope above with `source: openaq`,
 `station_id: openaq:<location_id>`, a string sensor ID, computed `event_id` and
 `revision_hash`, and a full-response reference `raw_response_id`. All returned
@@ -88,7 +92,7 @@ Weather envelopes use schema version 1 and `source: open-meteo`, with:
 
 - `location_id`, associated `station_ids`, `valid_time`, and explicit `model`.
 - `data_kind: modeled_weather`, requested coordinates and provider grid metadata.
-- `values`, per-variable `units`, and explicit flags for null values.
+- `values` and per-variable `units`; Spark derives explicit flags for null values.
 - `issue_time: null`, `available_at`, and `availability_basis: recorded_fetch_time`.
 - Collection/ingestion timestamps, original per-hour payload, and full-response reference.
 - `event_id` from source/location/hour/model; `revision_hash` from values, units
@@ -122,6 +126,7 @@ replace HDFS archival. See [operations](collectors.md).
 | `air_quality_raw` | One source sensor measurement, with period, original payload, identities, revisions, quality, and collection/ingestion metadata. | Source-qualified station ID |
 | `weather_raw` | One location/valid-hour record, with model provenance, fetch vintage, and issue time when supplied (recorded availability otherwise). | Weather location key |
 | `air_quality_latest` | Explicit source snapshot with observed time and value; no invented reporting period. | Source-qualified station ID |
+| `source_catalog` | Parameter/station metadata and weather mapping policy, consumed by Spark. | Source entity ID |
 
 The optional Docker Kafka/collectors profiles create three partitions per topic and seven-day
 retention, with one replica. Weather location mappings remain separate from station
@@ -138,6 +143,12 @@ contains guarded current observation revisions, `measurement_revisions` retains
 distinct content, `latest_measurements` serves latest detailed sensor periods,
 `source_latest` contains explicit instant snapshots, and `weather_vintages` retains
 fetch availability. These source facts are separate from future hourly views.
+
+Spark owns these serving writes. Collector catalog caches, `collector_latest`,
+raw responses, outbox and jobs stay in the separate control database. Invalid
+Kafka events are retained by Spark in `stream_rejections` with original bytes
+and topic/partition/offset. Successful micro-batch offset summaries are stored
+under `control/stream:<query-name>` after all partition writes succeed.
 
 | Processing/serving collection | Pending purpose |
 | --- | --- |

@@ -43,14 +43,17 @@ The JSON output also retains original records, revision history, quality failure
 The crawler discovers **all OpenAQ locations and parameters**, including stations
 with unknown city names. MongoDB schema v2 separates catalog, measurements,
 revisions, fast latest snapshots, weather vintages and durable crawler jobs.
-`database.MongoDB` provides the dedicated read/write API.
+`database.MongoDB` provides the dedicated read/write API. The serving path is
+**collectors → Kafka → Spark Structured Streaming → MongoDB**. Collectors use a
+separate control database for jobs, quotas, metadata cache and the durable outbox;
+only Spark projects Kafka events into the serving database.
 
 Put `OPENAQ_API_KEY` in `.env`, then start the continuous Docker deployment:
 
 ```sh
 if [ ! -f .env ]; then cp .env.example .env; fi
-docker compose --profile collectors up -d --build --wait
-docker compose logs -f crawler
+docker compose --profile pipeline up -d --build --wait
+docker compose logs -f crawler spark
 ```
 
 The service refreshes the global inventory daily, checks recent latest snapshots
@@ -60,9 +63,9 @@ leases, checkpoints, revisions and shared API budgets support restart recovery.
 Provider quotas can lengthen global refresh cycles; the status command exposes
 backlogs rather than promising every station updates within an hour.
 
-See [operation and API limits](docs/collectors.md), [MongoDB schema and Python
+See [Spark pipeline and migration](docs/streaming.md), [operation and API limits](docs/collectors.md), [MongoDB schema and Python
 reads](docs/mongodb-schema.md), and [live verification](docs/source-feasibility.md).
-Spark/HDFS, hourly serving views, the API/dashboard and the assessed Kubernetes
+HDFS, hourly serving views, the API/dashboard and the assessed Kubernetes
 deployment remain pending.
 
 Keep small samples in `data/`; store credentials, generated models, checkpoints, and large datasets outside Git. Generated local results belong in the ignored `data/outputs/` directory.

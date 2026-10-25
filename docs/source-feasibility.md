@@ -3,6 +3,14 @@
 Verification date: **2026-10-20**. The configured scope is the complete global
 OpenAQ catalog, with no country/radius/station cap and all returned parameters.
 
+The source observations below are historical verification of the earlier
+deployment. The current serving path is collectors → Kafka → Spark → MongoDB,
+with a separate collector-control database; see [pipeline operation](streaming.md).
+On **2026-10-25**, synthetic integration tests against real MongoDB/Kafka/Spark
+verified the new boundary, duplicate/revision handling, rejected-record retention
+and restart from the same Spark checkpoint. This does not reverify live source
+availability or establish usable historical coverage.
+
 ## OpenAQ
 
 Live authentication and global endpoints have been verified. The initial two-page
@@ -51,4 +59,4 @@ state after recreation.
 The configured hourly latest/weather schedules are targets subject to shared API
 quotas and backlog, not a guaranteed hourly refresh of every worldwide sensor.
 Usable 90-day history, source cadence/quality completeness, HDFS archive, Spark
-processing and end-to-end serving freshness still require later verification.
+hourly aggregation and end-to-end serving freshness still require later verification.
