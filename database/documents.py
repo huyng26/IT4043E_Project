@@ -129,4 +129,5 @@ def measurement_document(envelope):
         "source_flags": envelope["source_flags"],
         "provider_payload": envelope["provider_payload"],
         "raw_response_id": envelope.get("raw_response_id"),
+        "kafka": envelope.get("kafka"),
     }

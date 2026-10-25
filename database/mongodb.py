@@ -353,11 +353,22 @@ class MongoDB:
             .limit(limit)
         )
 
-    def save_latest_snapshot(self, payload, parameter, collected_at, response_id):
+    def save_latest_snapshot(
+        self,
+        payload,
+        parameter,
+        collected_at,
+        response_id,
+        *,
+        collection="source_latest",
+        track_dispatch=True,
+    ):
+        if collection not in ("source_latest", "collector_latest"):
+            raise ValueError("invalid snapshot collection")
         sensor_id = f"openaq:{payload['sensorsId']}"
         observed = utc_time(payload["datetime"]["utc"], "latest.datetime")
         fingerprint = digest(payload)
-        previous = self.db.source_latest.find_one({"_id": sensor_id})
+        previous = self.db[collection].find_one({"_id": sensor_id})
         order = (
             order_time(observed) + ":" + order_time(collected_at) + ":" + fingerprint
         )
@@ -380,14 +391,16 @@ class MongoDB:
             "payload_hash": fingerprint,
             "provider_payload": payload,
             "raw_response_id": response_id,
-            "details_pending": changed
-            or bool(previous and previous.get("details_pending")),
+            "details_pending": track_dispatch
+            and (changed or bool(previous and previous.get("details_pending"))),
         }
-        self._replace_if_newer("source_latest", sensor_id, document, "snapshot_order")
+        self._replace_if_newer(collection, sensor_id, document, "snapshot_order")
         return document["details_pending"]
 
-    def mark_latest_dispatched(self, sensor_id, payload):
-        self.db.source_latest.update_one(
+    def mark_latest_dispatched(self, sensor_id, payload, *, collection="source_latest"):
+        if collection not in ("source_latest", "collector_latest"):
+            raise ValueError("invalid snapshot collection")
+        self.db[collection].update_one(
             {"_id": sensor_id, "payload_hash": digest(payload)},
             {"$set": {"details_pending": False}},
         )
@@ -572,6 +585,37 @@ class MongoDB:
 
     def progress(self, key):
         return self.db.control.find_one({"_id": key})
+
+    def record_stream_rejection(self, record, error):
+        identity = digest([record["topic"], record["partition"], record["offset"]])
+        self.db.stream_rejections.update_one(
+            {"_id": identity},
+            {
+                "$setOnInsert": {
+                    "schema_version": 2,
+                    "topic": record["topic"],
+                    "partition": record["partition"],
+                    "offset": record["offset"],
+                    "broker_timestamp": record.get("timestamp"),
+                    "key": bytes(record["key"])
+                    if record.get("key") is not None
+                    else None,
+                    "value": bytes(record["value"])
+                    if isinstance(record.get("value"), (bytes, bytearray))
+                    else record.get("value"),
+                    "error": error,
+                    "processed_at": now(),
+                }
+            },
+            upsert=True,
+        )
+
+    def complete_stream_batch(self, query_name, batch_id, offsets):
+        self.db.control.update_one(
+            {"_id": "stream:" + query_name},
+            {"$set": {"batch_id": batch_id, "offsets": offsets, "completed_at": now()}},
+            upsert=True,
+        )
 
     def set_state(self, key, **fields):
         self.db.control.update_one(
@@ -847,7 +891,12 @@ class MongoDB:
         }
 
     def iter_outbox_envelopes(self):
-        return self.db.collector_outbox.find({}, {"envelope": 1}).batch_size(500)
+        return self.db.collector_outbox.find(
+            {}, {"envelope": 1, "topic": 1, "key": 1}
+        ).batch_size(500)
+
+    def iter_catalog_stations(self):
+        return self.db.stations.find({}).batch_size(500)
 
     def iter_legacy_stations(self):
         return self.db.stations.find(

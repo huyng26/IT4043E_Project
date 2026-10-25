@@ -49,6 +49,10 @@ VALIDATORS = {
         {"observed_at": {"bsonType": "date"}},
     ),
     "weather_locations": validator(["latitude", "longitude"], {}),
+    "collector_latest": validator(
+        ["sensor_id", "observed_at", "collected_at", "payload_hash"],
+        {"observed_at": {"bsonType": "date"}},
+    ),
     "station_weather": validator(["station_id", "weather_location_id"], {}),
     "weather_vintages": validator(
         ["location_id", "valid_time", "available_at", "model"],
@@ -85,6 +89,10 @@ INDEXES = {
     "latest_measurements": [([("station_id", 1), ("parameter", 1)], {})],
     "source_latest": [([("station_id", 1), ("parameter", 1), ("observed_at", -1)], {})],
     "station_weather": [([("weather_location_id", 1), ("station_id", 1)], {})],
+    "collector_latest": [([("sensor_id", 1)], {})],
+    "stream_rejections": [
+        ([("topic", 1), ("partition", 1), ("offset", 1)], {"unique": True})
+    ],
     "weather_vintages": [
         (
             [("location_id", 1), ("model", 1), ("valid_time", 1), ("available_at", -1)],
