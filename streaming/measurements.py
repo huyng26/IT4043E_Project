@@ -1,10 +1,30 @@
 """Initial PM2.5 rules, independent of infrastructure and network access."""
 
-from datetime import timedelta
 import math
+from datetime import timedelta
 from typing import cast
 
-from models import HourlyMetric, JSONValue, Measurement, MeasurementEvent
+from models import (
+    HourlyMetric,
+    JSONValue,
+    Measurement,
+    MeasurementEvent,
+    canonical_json,
+    digest,
+    timestamp,
+    utc_time,
+)
+
+# Preserve the shared helper imports used by collectors and database modules.
+__all__ = [
+    "canonical_json",
+    "current_measurements",
+    "digest",
+    "hourly_metrics",
+    "parse_measurement",
+    "timestamp",
+    "utc_time",
+]
 
 
 def parse_measurement(raw: object) -> Measurement:
