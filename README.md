@@ -36,6 +36,18 @@ The replay validates hourly PM2.5 events, normalizes units, resolves duplicate d
 | `demo:station-1` | 01:00 | 35 |
 | `demo:station-2` | 00:00 | 0 |
 
+Collector and pipeline-contract tests (OpenAQ pagination and adaptation, HTTP
+retries, settings validation, and collector envelopes accepted by the Spark-side
+validators) need the collector dependencies, but no network or running services.
+Without them those test modules are skipped:
+
+```sh
+python3 -m pip install -e ".[collectors]"
+python3 -m unittest discover -s tests -v
+```
+
+GitHub Actions runs both variants on Python 3.11 and 3.13 for every push and pull request.
+
 The JSON output also retains original records, revision history, quality failures, and malformed input lines. See the [implemented input contract](docs/data-contracts.md). This is a bounded, in-memory correctness demo. The fixture is unsuitable for real monitoring, training, or evaluation.
 
 ## Collect source data globally
