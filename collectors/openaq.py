@@ -97,10 +97,13 @@ def adapt_measurement(payload, sensor, collected_at, ingested_at=None):
     if not isinstance(period, dict):
         raise ValueError("OpenAQ measurement period is required")
     # Preserve any inline flags conservatively; coverage/summary are not quality flags.
+    # OpenAQ v3 sends flagInfo {"hasFlags": false} on unflagged rows; only that
+    # explicit negative is ignored, any other shape is still treated as a flag.
     source_flags = []
     for field in ("flags", "flagInfo"):
-        if payload.get(field):
-            source_flags.append(f"openaq:{field}:{digest(payload[field])}")
+        flag = payload.get(field)
+        if flag and flag != {"hasFlags": False}:
+            source_flags.append(f"openaq:{field}:{digest(flag)}")
     try:
         envelope = {
             "schema_version": 1,

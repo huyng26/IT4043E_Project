@@ -84,7 +84,8 @@ OpenAQ emits the PM2.5 envelope above with `source: openaq`,
 `station_id: openaq:<location_id>`, a string sensor ID, computed `event_id` and
 `revision_hash`, and a full-response reference `raw_response_id`. All returned
 OpenAQ parameters are collected; PM2.5 keeps the established processing policy.
-Inline flags are retained and conservatively mapped into `source_flags`. Structurally invalid
+Inline flags are retained and conservatively mapped into `source_flags`; only the
+explicit `flagInfo: {"hasFlags": false}` sent on unflagged rows is ignored. Structurally invalid
 measurements become rejected envelopes with `status`, `error`, original
 `provider_payload`, and collection/ingestion metadata.
 
