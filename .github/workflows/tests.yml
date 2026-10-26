@@ -13,11 +13,12 @@ jobs:
         python-version: ["3.11", "3.13"]
         extras: ["none", "collectors"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          # The pip cache folder only exists once something was installed.
+          cache: ${{ matrix.extras == 'collectors' && 'pip' || '' }}
       # "none" proves the replay slice still runs with the standard library only.
       - name: Install collector dependencies
         if: matrix.extras == 'collectors'
