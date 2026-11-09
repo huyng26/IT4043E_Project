@@ -1,8 +1,19 @@
 # Architecture diagrams
 
+The [updated architecture](../architecture.md#target-data-flow) and
+[dirty-data flow](../data-quality.md#architecture-change) include the proposed
+isolated fault-injection branch, shared quality rules and quarantine/reporting.
+The static Excalidraw/PNG/SVG drawings below predate that proposal and do not show
+those additions. Use the linked Mermaid views for the revised target flow.
+
 Two focused views describe the Urban Air Quality design: the services that move and process data, and the data identities and storage lifecycle. Field definitions, schedules, sizing and recovery policies stay in the linked documentation.
 
 Read the [design rationale](design-rationale.md) for the reasons behind the architecture, its tradeoffs, and the diagrams' shapes and visual conventions.
+
+Start with the [worked examples](worked-examples.md) to follow a reading from
+provider response through Kafka and Spark into MongoDB, including duplicates,
+corrections, invalid input, weather vintages and the planned dashboard path.
+The walkthrough also includes a runnable local example with expected results.
 
 | View | Editable drawing | Report images |
 | --- | --- | --- |
@@ -16,11 +27,11 @@ Read the [design rationale](design-rationale.md) for the reasons behind the arch
 
 ![System architecture](system-architecture.png)
 
-Read left to right. Independent collectors capture provider responses and source facts in MongoDB, then publish the durable outbox to Kafka. Publication is marked complete after the Kafka acknowledgement; repeat delivery remains possible.
+Read left to right. Independent collectors capture provider responses and stage envelopes in a durable outbox in the collector control database, then publish to Kafka. Publication is marked complete after the Kafka acknowledgement; repeat delivery remains possible. Spark consumes Kafka and writes source facts to the separate serving database.
 
 Kafka feeds independent **speed** processing and **raw archival**. Bounded Spark batch and analytics jobs read/write HDFS and publish corrected history, MLlib forecasts and GraphFrames results. The bidirectional HDFS link represents reads and writes; these jobs need not run together.
 
-The MongoDB boxes show responsibilities within the same logical database. FastAPI selects batch results only when a published generation covers that key's latest processed input; otherwise it uses speed results. It also reads catalog/weather facts, an ancillary link omitted for clarity. API/dashboard arrows show result flow.
+The MongoDB boxes group storage responsibilities. The current implementation separates collector control and serving into two logical databases, which can share a server. Planned FastAPI selects batch results only when a published generation covers that key's latest processed input; otherwise it uses speed results. It also reads catalog/weather facts, an ancillary link omitted for clarity. API/dashboard arrows show result flow.
 
 ## Data architecture
 
@@ -37,6 +48,13 @@ The lower view shows storage lifecycle. Green represents speed projections. Arch
 ## Status and contracts
 
 Solid application outlines indicate implemented components/source collections; dashed outlines indicate planned components/datasets. External providers also use solid outlines. This describes implementation status, not deployment health. Collection covers all OpenAQ locations and parameters; initial aggregation supports stationary, UTC-aligned hourly PM2.5 observations.
+
+The drawings predate the implemented Kafka → Spark → MongoDB fact-projection
+path and the split into collector/serving databases. Their Spark outline and
+storage grouping therefore need to be read with this update: Spark source-fact
+projection is implemented; Spark hourly views, HDFS archival, batch/analytics,
+FastAPI, React and Kubernetes remain planned. Hourly rules run in the local replay.
+See the [worked examples](worked-examples.md) for the current ownership and flow.
 
 Cylinders represent persistent storage, queue profiles represent Kafka transport, stacked documents represent retained versions or datasets, and the browser frame represents React. These shapes are schematic; their layers do not indicate replication or partition counts.
 

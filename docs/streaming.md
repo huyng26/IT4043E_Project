@@ -6,6 +6,10 @@ The implemented serving path is:
 OpenAQ / Open-Meteo → collectors → Kafka → Spark Structured Streaming → serving MongoDB
 ```
 
+The [dirty-data design](data-quality.md) proposes a separate controlled replay
+branch and more explicit quality stages. It is not implemented. Existing startup
+commands continue to consume the four live topics below; they do not inject faults.
+
 ## Ownership
 
 `MONGO_COLLECTOR_DATABASE` defaults to `urban_air_quality_collector`. It contains
@@ -110,6 +114,29 @@ outbox must be recovered using the old deployment before switching database name
 
 HDFS archival, Spark hourly views, batch publication, Kubernetes, ML, API and the
 dashboard remain subsequent work; this change establishes the processing boundary.
+
+## Planned quality processing and replay
+
+Factor parsing, supported representation repairs, revision selection and quality
+decisions into a shared versioned policy used by local replay, Spark speed and
+Spark batch processing. Extend strict parsing deliberately for numeric strings;
+persist received input and repair actions. Identifiable invalidating corrections
+must replace older usable revisions. Retain existing rejected-byte storage and
+add retry-safe quality summaries and coverage with known cadence denominators.
+
+A new bounded producer will read a frozen snapshot and publish labeled experiment
+wrappers to `quality_replay_raw`. A separate dispatcher/job will decode them and
+apply shared rules to an experiment-only MongoDB database, run-scoped archives
+and separate checkpoints. The wrapper carries lineage, not expected answers;
+only the evaluator reads the mutation manifest. The existing topic list and
+`prepare_record` cannot accept these wrappers without that implementation.
+
+Archive every replay record independently of speed processing, including malformed
+inner payloads. Preserve original collection and weather availability metadata;
+use separate replay/processing clocks. A delayed event must still reach current
+facts and batch reconciliation even when omitted from watermarked diagnostics.
+See the [experiment contract](data-quality.md#transport-and-lineage-contract--pending)
+for exact byte preservation, identity/hash rules and restart behavior.
 
 ## Integration verification
 

@@ -6,6 +6,10 @@ Thumbs.db
 *.swp
 *.swo
 
+# Downloaded RPM packages (including numbered duplicate downloads)
+*.rpm
+*.rpm.*
+
 # Environment files and local secrets
 .env
 .env.*

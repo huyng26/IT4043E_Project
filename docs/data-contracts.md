@@ -2,6 +2,11 @@
 
 The [system design](system-design.md) defines the target Kafka/HDFS/MongoDB contracts. This document distinguishes implemented replay/collector envelopes and staging from processing and serving interfaces still awaiting implementation.
 
+The proposed [dirty-data extension](data-quality.md) adds controlled replay and
+quality decisions. It does not change the implemented schema-version-1 parser or
+the four live topic contracts. Numeric-string repair, experiment dispatch and
+derived quality schemas require implementation before those inputs are accepted.
+
 ## Implemented local PM2.5 envelope
 
 `streaming/measurements.py` parses internal PM2.5 envelopes; `streaming/replay.py`
@@ -135,6 +140,44 @@ identities. Rejected source records stay on their corresponding raw topic.
 
 Raw HDFS records retain Kafka topic, partition, offset, broker timestamp, original bytes, and provenance, including malformed events. Partition raw data by source/ingestion date, curated Parquet by observation date, and keep checkpoints, versioned features/models, and benchmarks separate.
 
+## Proposed experiment and quality contracts — pending
+
+`quality_replay_raw` carries a versioned wrapper with `run_id`, `delivery_id`,
+`dataset_kind: controlled_corruption`, `original_topic`, `original_key`,
+`source_record_ref`, `payload_base64`, `payload_sha256`, release index and actual
+publication time. Inner bytes may be malformed. Preserve the provider's `source`
+and identity semantics inside valid payloads. A new dispatcher must decode this
+wrapper before invoking shared processing logic; the live consumer cannot do so.
+
+The evaluator-only manifest records the snapshot checksum, seed, versions,
+per-record mutations/omissions, expected results and emitted deliveries. Keep
+fault labels and original reference values out of processing input. Retain both
+original and corrupted bytes; record repairs as derived transformations instead
+of overwriting the received event. Explicit hash handling is defined in the
+[transport contract](data-quality.md#transport-and-lineage-contract--pending).
+
+Proposed quality decisions identify delivery coordinates, logical event/revision
+when recoverable, rule version, original/normalized values, repair actions,
+quality flags and terminal disposition (`accepted` or `quarantined`). Duplicate,
+superseded, repaired and flagged are overlapping attributes. Unknown identities
+stay null; never guess a key to retract an existing observation. Quarantine and
+current-revision selection retain the semantics documented above.
+
+Quality summaries use delivery-level denominators for transport/parsing and
+current-observation/sensor-hour denominators for usable coverage. A gap requires
+a known active inventory and expected cadence. Unknown completeness remains
+null. Persist deterministic decisions before summarization so retries cannot
+inflate counts. Suspected anomalies are warnings, separate from hard exclusions.
+
+Use a separate experiment MongoDB database per run, matching run-scoped HDFS paths
+and unique query checkpoints. Store planned derived `quality_decisions` and
+`quality_summaries` there for experiments and in serving storage for live input.
+These collections and their validators/indexes are not in the implemented v2
+schema yet. Continue using `stream_rejections` for original rejected bytes.
+Expose the dataset/run and rule version in every quality response. Replay clocks
+remain separate from original collection/availability timestamps; experimental
+data is excluded from primary model training/evaluation and normal graph results.
+
 ## MongoDB source facts implemented; hourly serving pending
 
 The dedicated `database.MongoDB` class now implements versioned catalog and source
@@ -160,6 +203,12 @@ under `control/stream:<query-name>` after all partition writes succeed.
 | `control` publication keys | Processing/publication state beyond existing collector progress. |
 
 Publish a batch generation only after all writes/checks succeed. Serve a batch key when it covers that key's latest processed input, otherwise its speed view. Retain serving provenance in API results.
+
+Under the proposed quality extension, derived views and publication state also
+record `rule_version`; selection requires the active policy as well as covered
+input. A policy update publishes a validated generation rather than overwriting
+earlier decisions. Experiment decision keys use `(run_id, delivery_id, rule_version)`;
+transport attempts retain their own Kafka coordinates and counts.
 
 ## Forecasts and API — pending
 

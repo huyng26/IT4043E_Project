@@ -80,6 +80,14 @@ reads](docs/mongodb-schema.md), and [live verification](docs/source-feasibility.
 HDFS, hourly serving views, the API/dashboard and the assessed Kubernetes
 deployment remain pending.
 
+The [proposed dirty-data processing design](docs/data-quality.md) adds a
+reproducible fault-injection/replay branch, explicit Spark cleaning stages,
+quarantine and quality/coverage reports. It preserves original API data and
+isolates injected faults from live monitoring and primary forecast evaluation.
+The injector and new quality views are planned; current run commands are unchanged.
+Inactive placeholders and the required integration changes are listed in the
+[quality implementation map](docs/data-quality-implementation.md).
+
 Keep small samples in `data/`; store credentials, generated models, checkpoints, and large datasets outside Git. Generated local results belong in the ignored `data/outputs/` directory.
 
 Start with the [detailed system design](docs/system-design.md), which records the agreed Lambda architecture, required technologies, Spark assessment coverage, and implementation milestones. The [implementation plan](docs/implementation-plan.md), [architecture](docs/architecture.md), and [data contracts](docs/data-contracts.md) describe the first executable slice and the remaining work.

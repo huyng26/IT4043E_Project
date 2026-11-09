@@ -6,6 +6,11 @@ Collectors use a separate operational database; Spark owns serving projections.
 Usable historical coverage, assessed Kubernetes deployment, Spark hourly views and HDFS remain pending. See
 the [collector guide](collectors.md) and [source status](source-feasibility.md).
 
+Design revision: add explicit dirty-data processing, quality reporting and an
+isolated fault-injection experiment. These additions are **planned**, not features
+of the current deployment. See [dirty-data processing](data-quality.md) for the
+complete proposal, fault matrix, contracts and evaluation method.
+
 This document records the detailed design agreed for the milestone project. It supersedes the preliminary technology choices; the architecture, data-contract, and implementation notes now follow this stack and describe the first executable local slice.
 
 ## 1. Architecture and objectives
@@ -28,6 +33,10 @@ Agreed defaults:
 - React dashboard using FastAPI.
 - Real historical data for analysis and model evaluation.
 - Separate, clearly labeled generated workloads for performance testing.
+- Profile natural source defects; preserve original API data and create labeled,
+  reproducible corrupted copies only in an isolated experiment path.
+- Make repairs, rejections, missing coverage and quality changes visible, alongside
+  concentration and freshness. Treat suspected sensor anomalies as warnings.
 
 ## 2. Components and data flow
 
@@ -41,6 +50,7 @@ flowchart TD
     A --> H[HDFS immutable raw history]
 
     K --> S[Spark speed processing]
+    S --> Q[Quality decisions and quarantine]
     S --> MV[MongoDB current readings and speed views]
 
     H --> B[Spark batch processing]
@@ -58,7 +68,18 @@ flowchart TD
     F --> API
     GA --> API
     API --> UI[React dashboard]
+    H --> SNAP[Fixed experiment snapshot]
+    SNAP --> INJ[Seeded fault injector]
+    INJ --> RK[Kafka quality_replay_raw]
+    RK --> EXP[Isolated Spark replay and archive]
+    EXP --> ER[Experiment storage and quality report]
 ```
+
+The experiment branch uses the same versioned quality rules as live processing,
+with separate databases, archive paths and checkpoints. Its new topic carries an
+outer lineage wrapper and exact inner bytes, so malformed data can be evaluated
+without losing its run/delivery identity. It requires a new experiment dispatcher;
+the existing four-topic Spark consumer does not support it yet.
 
 ### Component responsibilities
 
@@ -70,6 +91,8 @@ flowchart TD
 | Raw archive query | Write every Kafka record to HDFS, including invalid records and broker coordinates needed for audit and replay. |
 | Spark speed processing | Validate events, normalize units, maintain current readings, and recompute affected hourly monitoring results. |
 | Spark batch processing | Rebuild corrected history from archived events and produce hourly/daily analytics and feature datasets. |
+| Shared quality policy | Parse, repair supported representations, select revisions, flag invalid/suspect readings, measure coverage, and retain explainable decisions/quarantine in both processing paths. |
+| Experiment producer/evaluator | Corrupt a fixed snapshot with a recorded seed; replay into isolated storage and compare processing outcomes against a separate manifest. |
 | HDFS | Store raw history, curated Parquet, checkpoints, models, and processing evidence. |
 | MongoDB | Store indexed dashboard views, forecasts, station metadata, graph results, and processing control records. |
 | ML pipeline | Prepare features, train and evaluate Spark MLlib models, and generate hourly forecasts. |
@@ -121,6 +144,11 @@ catalog metadata topic:
 | `air_quality_latest` | One instant source snapshot with stable identity and revision; source period remains unknown. | Source-qualified station ID |
 | `source_catalog` | Station/parameter metadata and weather location mapping policy. | Source entity ID |
 
+The proposed `quality_replay_raw` topic is separate from these four live topics.
+Use run-scoped experiment storage and an experiment-only consumer; never write
+its observations into the live serving database. The wrapper, hash handling and
+replay clock are specified in the [quality contract](data-quality.md#transport-and-lineage-contract--pending).
+
 Start with three partitions per topic, seven-day retention, and replication factor one for the local broker.
 
 Every event includes:
@@ -132,6 +160,36 @@ Every event includes:
 - Weather issue time when supplied; recorded availability time otherwise.
 
 Use UTC internally. Keep weather location mappings separate from station identities, and label modeled weather appropriately.
+
+### Dirty-data processing and quality evidence — proposed
+
+First profile real source data for units, source flags, missingness, cadence,
+revisions and repeat deliveries. A tidy response schema is insufficient evidence
+of usable readings. Then demonstrate controlled duplicates, unit variations,
+numeric strings, invalid/missing values, malformed payloads, equivalent timezone
+formats, gaps, delayed events and sensor anomalies using a frozen copied dataset.
+
+Processing order is preserve → parse → repair representation → select revisions
+→ assess quality/enrich → aggregate with coverage → publish. Numeric-string
+repair extends the current strict contract; never infer missing concentration,
+station identity or timezone without an explicit policy. Zero remains valid.
+Resolve identifiable revisions before quality filtering so an unusable correction
+removes an older contribution. Preserve received bytes and a versioned action
+history; quarantine structural failures with their transport coordinates.
+
+Publish quality summaries with accepted/quarantined terminal outcomes and separate
+overlapping attributes for repairs, flags, duplicates and superseded revisions.
+Derive retry-safe counts. Calculate completeness only when active inventory and
+expected cadence establish a denominator. Distinguish unknown coverage from zero
+coverage. Statistical spikes/flatlines initially add warnings, without automatic
+removal of high positive readings or replacement of monitoring history.
+
+Evaluate repairs, false positives, quarantine, gap detection, lost coverage,
+aggregate effects and recovery using the [experiment protocol](data-quality.md#evaluation-and-assessment-demonstration).
+Keep expected answers outside processing inputs. Fault-derived data is confined
+to labeled processing/robustness experiments; primary ML and graph outputs use
+real history. Add quality visibility and quarantine replay before optional
+neighbor-based sensor-health analysis.
 
 **HDFS organization:** raw data partitioned by source and ingestion date; curated data by observation date; versioned feature/model datasets; separate checkpoint and benchmark directories. Preserve original events and revisions rather than overwriting raw history.
 
@@ -156,6 +214,10 @@ Use regular MongoDB collections with deterministic keys and compound indexes for
 - After updating current measurements, speed processing recomputes affected station/hour groups from the complete deduplicated readings. Corrections therefore replace earlier contributions.
 
 Batch jobs read a fixed, committed archive snapshot and record its Kafka offset cutoff for each partition. They write a new generation of results and publish it only after all outputs and checks succeed.
+
+Derived views also carry their quality-rule version. A policy change requires a
+validated new generation; serving selection must require the active rule version
+as well as input coverage, avoiding mixed-policy speed and batch results.
 
 For each hourly key, FastAPI:
 
@@ -193,6 +255,7 @@ Retain the existing monitoring routes and add pipeline and graph visibility:
 | `/api/v1/stations/{id}/predictions` | Latest forecast origin, horizons, model, and input freshness. |
 | `/api/v1/analytics/station-network` | Station relationships and graph results. |
 | `/api/v1/pipeline/status` | Collector progress, processing lag, archive progress, and batch publication status. |
+| `/api/v1/quality/summary` | Planned quality counts, rule version, coverage and quarantine reasons, with explicit live or experiment/run scope. |
 
 History defaults to 24 hours, permits at most 90 days per query, and uses cursor pagination capped at 1,000 rows. Responses expose units and UTC timestamps. Missing values remain null.
 
@@ -207,7 +270,7 @@ Every listed technique receives an implementation, expected result, and saved ev
 | Window functions and advanced aggregations | Hourly/daily statistics, lag features, rolling means, standard deviation, percentiles, and station rankings. |
 | Pivot and unpivot | Unpivot hourly weather variables into a long representation; pivot them into feature columns. |
 | Custom aggregation | A batch Pandas aggregate UDF calculating a coverage-weighted concentration statistic for bounded station/day groups. |
-| Multistage transformations | Parse → validate → normalize → resolve revisions → enrich → aggregate → prepare features. |
+| Multistage transformations | Preserve → parse/validate → repair/normalize → resolve revisions → assess quality/enrich → aggregate with coverage → prepare features; save before/after evidence from labeled faults. |
 | Custom business UDF | Classify measurement quality from source flags, validity, units, and reporting metadata; compare its cost with native expressions where equivalent. |
 | Broadcast joins | Enrich measurements with small station, location-mapping, and unit-policy datasets. |
 | Sort-merge joins | Join historical pollution and weather fact datasets on location and valid hour. |
@@ -236,6 +299,9 @@ Features include past pollution lags, rolling statistics, past available weather
 - Validate genuine availability-aware behavior with archived live vintages and forward evaluation.
 - Run inference hourly; expose missing forecasts when inputs fail freshness or coverage checks.
 - Deploy the learned model only if evaluation supports it; otherwise serve the labeled baseline.
+- Include missingness/age indicators and fit imputation only on training features.
+  Keep measured history and evaluation targets unimputed. Controlled corruption
+  may evaluate robustness separately, with unchanged real held-out targets.
 
 ### Station graph
 
@@ -252,13 +318,18 @@ Use a compatible Spark/Scala dependency set. A concrete baseline is Spark 3.5.8,
 | 1. Executable rules and source feasibility | Run a local fixture through validation, revision selection, and hourly aggregation with regression checks; record selected real sensors, cadence, history, and API access. The local replay is implemented; source feasibility remains pending. |
 | 2. Kubernetes infrastructure | Kafka, HDFS, MongoDB, and Spark start reproducibly; two executors process tasks and HDFS reports three replicas. |
 | 3. Ingestion and archive | Both sources reach Kafka; progress survives collector restarts; archived records retain provenance and support replay. |
-| 4. Monitoring path | Speed processing, FastAPI, and React show concentrations, history, missing data, and freshness. |
+| 3a. Quality experiment | Profile a frozen real sample; implement deterministic single-fault/mixed replays, isolated storage and shared repair/quarantine rules; save a baseline comparison and restart evidence. |
+| 4. Monitoring path | Speed processing, FastAPI, and React show concentrations, history, missing data, freshness, coverage and quality actions. |
 | 5. Batch serving | Corrected history is published safely; serving switches between speed and batch views without duplicate hours. |
 | 6. Advanced analytics | Every rubric demonstration runs; MLlib forecasts and GraphFrames results are available through the API. |
 | 7. Assessment package | Include startup instructions, architecture explanation, evidence, benchmark report, failure demonstrations, and limitations. |
 
 Required verification scenarios:
 
+- Reproduce a dirty-data run from its snapshot, seed, versions and manifest;
+  expected answers remain unavailable to the processor and live serving stays isolated.
+- Compare unchanged controls, repairable faults and destructive faults with
+  explicit denominators; retries do not inflate quality counts.
 - Repeated polling and repeated Spark batches leave concentration counts unchanged.
 - Corrections replace earlier values, including corrections to historical hours.
 - Records arriving before and beyond the diagnostic watermark have documented outcomes.

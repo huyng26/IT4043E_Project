@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "rule_version": "draft-v1",
+  "experiment": {
+    "run_id": null,
+    "snapshot_path": null,
+    "catalog_path": null,
+    "output_directory": null,
+    "seed": 4043,
+    "profile": "mixed-v1",
+    "selected_input_fraction": 0.2,
+    "fault_types": [
+      "duplicate_delivery",
+      "supported_unit_variation",
+      "numeric_string",
+      "missing_value",
+      "negative_value",
+      "equivalent_timezone",
+      "malformed_payload",
+      "unsupported_unit",
+      "delayed_delivery"
+    ],
+    "group_scenarios": [],
+    "topic": "quality_replay_raw",
+    "database": null,
+    "checkpoint_path": null
+  }
+}

@@ -2,7 +2,7 @@
 
 This document explains the choices shown in the [system](system-architecture.png) and [data](data-architecture.png) diagrams. It connects the architecture to the project's monitoring, correction, forecasting and assessment requirements, and explains the visual conventions used to present it.
 
-The [system design](../system-design.md) remains the authoritative specification. Collectors, MongoDB source storage, Kafka publication and the local PM2.5 replay are implemented. Spark/HDFS processing, derived serving views, FastAPI, React and the assessed Kubernetes deployment are planned. The diagrams show the target system with that distinction visible.
+The [system design](../system-design.md) remains the authoritative specification. Collectors, Kafka publication, Spark-to-MongoDB source-fact projections and the local PM2.5 replay are implemented. Spark hourly views, HDFS archival, batch/analytics, FastAPI, React and the assessed Kubernetes deployment are planned. The diagrams show the target system; their original status outlines predate Spark fact projection and the collector/serving database split. The [worked examples](worked-examples.md) explain the current flow and the planned extensions.
 
 ## What the design needs to support
 
@@ -18,17 +18,17 @@ The project also has an assessed stack: Kafka, PySpark, HDFS, MongoDB, Kubernete
 
 The cost is maintaining equivalent validation, revision selection and aggregation rules in both paths. The local replay provides an executable reference for those rules. Spark implementations must be checked against it; using the same technology alone would not guarantee equivalent results.
 
-**Capture before publication.** MongoDB holds original provider responses, source facts and a durable publication outbox. The collector can recover an interrupted response and retry pending publication without fetching a replacement response with different provenance. A response is marked staged only after the required fact and outbox writes finish.
+**Capture before publication.** The collector control database holds original provider responses and a durable publication outbox. The collector can recover an interrupted response and retry pending publication without fetching a replacement response with different provenance. A response is marked staged only after the required outbox writes finish. Spark materializes source facts in the separate serving database after Kafka consumption.
 
 Kafka acknowledgement comes before marking an outbox row published. A crash between those steps can cause another delivery, so downstream projections must tolerate repeats. This is an explicit recovery protocol; there is no atomic transaction spanning MongoDB and Kafka. The diagram's MongoDB-to-Kafka arrow represents the outbox publisher, not a database service directly pushing records.
 
-**Use Kafka between collection and processing.** Kafka buffers collected events and lets the speed query and archive query advance independently. A slow archive does not need to become part of each collector request. The three topics preserve different record semantics: detailed air-quality intervals, modeled weather with fetch vintages, and instant air-quality snapshots.
+**Use Kafka between collection and processing.** Kafka buffers collected events and lets the speed query and planned archive query advance independently. A slow archive does not need to become part of each collector request. Four topics preserve different record semantics: detailed air-quality intervals, modeled weather with fetch vintages, instant air-quality snapshots, and source catalog metadata.
 
 Kafka retention is bounded by the documented transport policy. HDFS is the planned replayable history store. Independent consumption requires separate progress/checkpoints and explicit recovery checks for each query.
 
 **Give MongoDB and HDFS different storage roles.** MongoDB supports catalog lookups, bounded station/time reads, guarded source projections and future dashboard views. HDFS retains every raw Kafka record, including invalid records and broker coordinates, then stores curated Parquet, features, models and checkpoints. Keeping raw input makes it possible to rerun corrected parsing or processing rules without treating earlier derived output as the original evidence.
 
-This separation introduces consistency work: batch computation must use a committed archive cutoff, and published results must identify their input coverage. The two MongoDB shapes show ingestion and serving responsibilities within the same logical database. They do not prescribe separate MongoDB deployments.
+This separation introduces consistency work: batch computation must use a committed archive cutoff, and published results must identify their input coverage. The two MongoDB shapes group ingestion and serving responsibilities. The implementation uses separate logical collector and serving databases, which can share one MongoDB deployment.
 
 **Publish batch generations and select results per key.** A batch job writes and validates a new generation before publishing it. FastAPI uses that generation for an hourly key only if it covers the key's latest processed input. Otherwise it uses the speed result. For example, a correction beyond the batch's input cutoff requires the speed result until a later published generation includes it. The batch job's completion time alone is insufficient evidence of coverage.
 
@@ -48,7 +48,7 @@ For example, two usable sensor readings of 30 and 40 produce an hourly mean of 3
 
 Regular MongoDB collections with deterministic keys and guarded updates implement these identities explicitly. The tradeoff is maintaining several projections. Interrupted writes are repaired through recoverable capture and replay; the source collections are not updated by one transaction spanning the whole pipeline.
 
-**Keep source snapshots separate from detailed periods.** `source_latest` provides fast change detection, but its source endpoint omits the reporting interval. Assigning an invented hour would turn freshness information into unsupported aggregation evidence. Detailed measurements supply the periods needed by the hourly processing policy. Separate collections and topics make that distinction visible through ingestion and future consumers.
+**Keep source snapshots separate from detailed periods.** The operational `collector_latest` cache provides fast change detection; Spark projects snapshots into serving `source_latest`. The source endpoint omits the reporting interval. Assigning an invented hour would turn freshness information into unsupported aggregation evidence. Detailed measurements supply the periods needed by the hourly processing policy. Separate collections and topics make that distinction visible through ingestion and future consumers.
 
 **Store weather mappings and fetch vintages explicitly.** `station_weather` maps eligible stationary coordinates to reusable weather locations, allowing stations to share a weather request location. `weather_vintages` retains the valid time, model and actual fetch availability for each vintage. A later fetch must not silently replace the evidence of what was available earlier.
 

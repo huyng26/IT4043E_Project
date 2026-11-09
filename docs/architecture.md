@@ -2,6 +2,12 @@
 
 The [detailed system design](system-design.md) is the authoritative design. The assessed deployment uses Lambda architecture with Kafka, PySpark, HDFS, MongoDB, Kubernetes, Spark MLlib, and GraphFrames.
 
+The proposed [dirty-data processing extension](data-quality.md) makes quality
+assessment and cleaning explicit. Preserve original API data, profile its natural
+defects, and use a separate reproducible corruption/replay path to demonstrate
+processing under controlled faults. Only inactive placeholders exist so far;
+the [implementation map](data-quality-implementation.md) lists their responsibilities.
+
 ## First executable path
 
 ```text
@@ -44,6 +50,7 @@ flowchart TD
     K --> AR[Spark raw archive query]
     AR --> H[HDFS immutable raw history]
     K --> SP[Spark speed processing]
+    SP --> Q[Quality decisions and quarantine]
     SP --> MV[MongoDB speed and current views]
     H --> B[Spark batch processing]
     B --> P[HDFS curated Parquet and features]
@@ -57,11 +64,38 @@ flowchart TD
     PRED --> API
     GA --> API
     API --> UI[React dashboard]
+    H --> SNAP[Fixed experiment snapshot]
+    SNAP --> INJ[Seeded fault injector]
+    INJ --> RK[Kafka quality_replay_raw]
+    RK --> EXP[Isolated Spark replay and archive]
+    EXP --> ER[Experiment storage and quality report]
 ```
 
 Collectors poll the two providers independently. Weather is associated with stations using an explicit coordinate/location mapping. Raw archival and speed processing progress independently. Both speed and batch paths must apply equivalent validation, unit, revision, and aggregation policies.
 
 Batch jobs rebuild corrected history from a fixed archive snapshot. FastAPI selects published batch results for keys whose latest processed input is covered, and speed results for newer changes or missing batch keys. Every result exposes its serving provenance.
+
+## Explicit processing and experiments — proposed
+
+The shared speed/batch policy becomes: preserve bytes → parse → repair supported
+representations → select current revisions → assess quality and enrich → aggregate
+with coverage → publish curated results and quality summaries. Quarantine retains
+unparseable input; identifiable unusable revisions still replace older values.
+Repair actions, rule versions and input lineage make each decision explainable.
+The current strict parser does not yet accept numeric-string repairs.
+
+The experiment producer reads a frozen real snapshot, creates deterministic
+faults and sends a wrapper containing the possibly malformed payload to a new
+experiment-only topic. A separate Spark job decodes it and runs the shared rules
+against an isolated database, HDFS paths and checkpoints. Expected answers stay
+in an evaluator-only manifest. Archive replay bytes as well as original input.
+The [quality design](data-quality.md) specifies faults, contracts and acceptance.
+
+Compare the processed baseline and corrupted run to demonstrate repair accuracy,
+deduplication, quarantine, coverage loss and final hourly consistency. Distinguish
+natural source defects from injected faults. Add quality reporting and optional
+sensor-health warnings; keep real pollution spikes visible. Generated corruption
+is excluded from primary forecast evaluation and normal station graph results.
 
 ## Folder responsibilities
 
@@ -69,7 +103,7 @@ Batch jobs rebuild corrected history from a fixed archive snapshot. FastAPI sele
 | --- | --- |
 | `config/` | Selected stations, cadence, polling intervals, unit/quality rules, and model settings. |
 | `collectors/` | Provider discovery, polling, adapters, and durable source progress. |
-| `streaming/` | Kafka manager, Spark-to-MongoDB projection pipeline and local replay; future HDFS archive, hourly speed views and batch jobs. |
+| `streaming/` | Kafka manager, Spark-to-MongoDB projections and local replay; future shared quality rules, bounded fault producer, HDFS archive, hourly views and batch jobs. |
 | `ml/` | Features, chronological evaluation, MLlib training/inference, and graph analysis entry points. |
 | `api/` | FastAPI endpoints, MongoDB queries, and speed/batch serving selection. |
 | `dashboard/` | React UI using FastAPI. |
