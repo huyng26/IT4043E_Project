@@ -1,33 +1,74 @@
 # Dirty-data implementation map
 
-Status: **inactive placeholders added; feature implementation pending**. The
+Status: **implementation steps 1–2 done locally; steps 3–6 pending**. Contracts,
+shared rules, profiling, coverage arithmetic and the deterministic fault builder
+are implemented and tested without Kafka, Spark, MongoDB or the network. The
 existing collector, local replay and four-topic Spark consumer still behave as
-before. New Python functions raise `NotImplementedError`; imports perform no
-network, database, topic or file writes. The example configuration is not loaded.
+before: nothing below is wired into them. Remaining placeholders raise
+`NotImplementedError`; imports perform no network, database, topic or file
+writes. The example configuration is `enabled: false` and refuses to run.
 The [quality design](data-quality.md) defines the intended behavior and evaluation.
 
-## New files and responsibilities
+## Files and responsibilities
 
-| Placeholder | Implement here |
+| File | Status | Responsibility |
+| --- | --- | --- |
+| [quality/contracts.py](../streaming/quality/contracts.py) | **Implemented** | Wrapper (exact field set, base64/SHA-256 checks), decision and evaluator-manifest shapes with validators; retry-safe decision keys. |
+| [quality/rules.py](../streaming/quality/rules.py) | **Implemented** (`rules-v1`) | `evaluate_payload` and `select_current_decisions`; see [shared rules](#shared-rules-rules-v1). |
+| [quality/profiling.py](../streaming/quality/profiling.py) | **Implemented** | Deterministic profile of a frozen snapshot (+ optional catalog): natural defects by kind, units, periods, duplicates, revisions, cadence, coverage. |
+| [quality/coverage.py](../streaming/quality/coverage.py) | **Implemented** | Catalog parsing, expected hourly sensor-hours and expected/received/usable/missing arithmetic. Unknown cadence yields `null`, not full coverage. |
+| [quality_replay.py](../streaming/quality_replay.py) | `build` **implemented**; `publish_replay` placeholder | Seeded single-fault, `mixed-v1` and control builds writing `replay.jsonl` + evaluator-only `manifest.json`. |
+| [quality/dispatcher.py](../streaming/quality/dispatcher.py) | Placeholder | Experiment-only wrapper decoding and executor projection into explicitly isolated storage. |
+| [quality_evaluation.py](../streaming/quality_evaluation.py) | Placeholder | Baseline comparison, repair correctness, precision/recall, false positives, coverage loss and retry/order invariance. Only this side reads expected answers. |
+| [quality_batch.py](../streaming/quality_batch.py) | Placeholder | Bounded shared-rule rebuilds and quarantine replay from fixed archive cutoffs; validate before publishing a new generation. |
+| [quality_schema.py](../database/quality_schema.py) | Placeholder | Future quality collection validators/indexes; integrate with the existing repository rather than adding a DB client. |
+| [api/quality.py](../api/quality.py) | Placeholder | Future bounded quality-summary router with explicit live or experiment/run scope. No FastAPI app/router exists yet. |
+| [dashboard/quality/README.md](../dashboard/quality/README.md) | Requirements only | Quality panel requirements until the React application exists. |
+| [quality_features.py](../ml/quality_features.py) | Placeholder | Future coverage/missingness/age features with availability-aware inputs and training-only feature imputation. |
+| [quality.example.json](../config/quality.example.json) | Draft, disabled | Configuration read by `quality_replay build`; set `enabled: true` in a copy to run. |
+
+The decision/dispatcher/storage interfaces are still drafts. `api/` and `ml/`
+remain outside the current setuptools package list; add their packaging and
+dependencies when those services are built.
+
+## Shared rules (`rules-v1`)
+
+`evaluate_payload(payload, source_topic=..., rule_version=...)` returns one
+decision per received payload and reuses `models`/`streaming.measurements` for
+identity, revision hash, unit factors and flags. Only `air_quality_raw` PM2.5 is
+supported; other topics or unknown rule versions raise `ValueError`.
+
+| Input | Outcome |
 | --- | --- |
-| [quality/contracts.py](../streaming/quality/contracts.py) | Wrapper, decision, summary and separate evaluator-manifest contracts. Topic/dataset constants reserve the planned names. |
-| [quality/profiling.py](../streaming/quality/profiling.py) | Profile frozen real data, natural defects, units, periods, revisions and known cadence before mutation. |
-| [quality/rules.py](../streaming/quality/rules.py) | Pure, versioned parse/repair/quality decisions shared by local replay, Spark speed and batch. Preserve received bytes and use existing measurement semantics. |
-| [quality/coverage.py](../streaming/quality/coverage.py) | Expected/received/usable/missing sensor-hours from known active inventory and cadence after revision selection. |
-| [quality/dispatcher.py](../streaming/quality/dispatcher.py) | Experiment-only wrapper decoding and executor projection into explicitly isolated storage. |
-| [quality_replay.py](../streaming/quality_replay.py) | Bounded deterministic fault generation, separate evaluator manifest, then optional Kafka publication using existing utilities. |
-| [quality_evaluation.py](../streaming/quality_evaluation.py) | Baseline comparison, repair correctness, precision/recall, false positives, coverage loss and retry/order invariance. Only this side reads expected answers. |
-| [quality_batch.py](../streaming/quality_batch.py) | Bounded shared-rule rebuilds and quarantine replay from fixed archive cutoffs; validate before publishing a new generation. |
-| [quality_schema.py](../database/quality_schema.py) | Future quality collection validators/indexes; integrate with the existing repository rather than adding a DB client. |
-| [api/quality.py](../api/quality.py) | Future bounded quality-summary router with explicit live or experiment/run scope. No FastAPI app/router exists yet. |
-| [dashboard/quality/README.md](../dashboard/quality/README.md) | Quality panel requirements until the React application exists. |
-| [quality_features.py](../ml/quality_features.py) | Future coverage/missingness/age features with availability-aware inputs and training-only feature imputation. |
-| [quality.example.json](../config/quality.example.json) | Inactive draft configuration for seed, fault profile, input selection and explicit experiment storage. |
+| Valid envelope | `accepted`; existing flags (`missing_value`, `negative_concentration`, `unsupported_unit`, `source_flagged`, `unsupported_reporting_period`) stay flags, never quarantine. |
+| Numeric string (`" 35.0 "`) | Repaired to what `json.loads` yields for the trimmed literal (action `numeric_string_parsed`), so a stringified baseline round-trips to the **same** revision hash. Only the JSON number grammar is accepted; `""`, `"unknown"`, `"1,5"`, `"+5"`, `".5"`, `"NaN"`, `"1e999"`, booleans and containers are quarantined as `unparseable_value`, never zero. |
+| Non-UTC offset | Same UTC instant and identity; action `timestamp_normalized_to_utc`. A timestamp without an offset is quarantined (`missing_timezone`). |
+| `µg/m³`, `μg/m³`, `mg/m3` | Action `unit_alias_normalized` / `unit_converted_to_ug_m3`, only when a concentration exists. Received value and unit are retained. `ppm` etc. are flagged, not converted. |
+| Claimed `event_id`/`revision_hash` | Must match the content **after** representation repair, otherwise `integrity_mismatch`. Absent hashes are allowed for local fixtures; the live path still requires them. |
+| Bad UTF-8/JSON, non-object, `status: rejected`, missing field, other schema failure, non-PM2.5 | `quarantined` with a reason and a null identity, so it cannot retract an observation. |
 
-`streaming/quality/__init__.py` marks the shared package. Function signatures and
-configuration fields are draft interfaces to refine during implementation, not
-completed processing APIs. `api/` and `ml/` remain outside the current setuptools
-package list; add their packaging/dependencies when those services are built.
+`select_current_decisions` mirrors `current_measurements` (greatest
+`(collected_at, revision_hash)`, then `ingested_at`) before usability filtering, so a
+correction to null/negative removes an earlier usable value. A parity test checks
+both against the fixture. Anomaly warnings, aggregation and hourly views are not
+part of this slice.
+
+## Building a replay
+
+```sh
+python -m streaming.quality_replay build --config my-quality.json \
+    --snapshot data/frozen.jsonl --output-dir runs/<name>
+```
+
+Profiles are `control` (snapshot bytes unchanged), `single-fault` (exactly one
+fault type) and `mixed-v1` (balanced round-robin over the configured faults).
+`selected_input_fraction` applies to valid PM2.5 deliveries (to eligible ones for
+`single-fault`); natural defects pass through unmutated. Selection uses
+`sha256(seed, record, fault)`; the run ID, delivery IDs, release order and both
+output files are byte-reproducible for the same snapshot, config and code. Outputs
+are created exclusively and an existing run is never overwritten. Group scenarios
+and publication are rejected explicitly. Expected outcomes in the manifest are
+written per fault, not computed by the rules, so the evaluator is not circular.
 
 ## Changes to existing implementation
 
@@ -70,6 +111,13 @@ work for durable batch replay; local frozen JSONL can support the first slice.
 6. **Serving and features.** Expose prepared quality summaries in FastAPI/React;
    add quality-aware features when the forecast pipeline exists. Optional sensor
    anomaly/neighbor warnings come after the core workflow.
+
+**Done:** steps 1 and 2 (contracts, profiling, shared rules, deterministic
+single-fault/mixed generation, local invariance checks in `tests/test_quality_*.py`).
+**Next:** step 3, `quality_evaluation.py` (baseline comparison, precision/recall,
+lost coverage) plus the grouped gap/delay/correction scenarios. The tests already
+replay generated wrappers through the rules and check manifest expectations; step 3
+turns that into a saved report.
 
 Start with steps 1–3 without Kafka, Spark or public APIs. No placeholder should be
 treated as a successful no-op: calling an unfinished operation fails explicitly.

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "enabled": false,
-  "rule_version": "draft-v1",
+  "rule_version": "rules-v1",
   "experiment": {
     "run_id": null,
     "snapshot_path": null,

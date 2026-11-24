@@ -1,9 +1,13 @@
 # Dirty-data processing and quality experiments
 
-Status: **proposed architecture extension with inactive placeholder modules**. The local
+Status: **partly implemented locally; the rest is proposed**. The local
 PM2.5 replay and Spark source-fact projections already validate, normalize,
-resolve revisions and retain rejected records. The fault injector, replay topic,
-extended repair rules, quality views and experiments below are not implemented.
+resolve revisions and retain rejected records. The shared repair rules (`rules-v1`),
+wrapper/decision/manifest contracts, snapshot profiling, coverage arithmetic and the
+deterministic fault builder (`python -m streaming.quality_replay build`) exist and
+are tested without infrastructure. Group scenarios, Kafka publication, the replay
+topic and dispatcher, the evaluator, quality views and experiments below are not
+implemented, and none of the new code is wired into the live path.
 The [system design](system-design.md) remains authoritative for the whole system.
 See the [implementation map](data-quality-implementation.md) for placeholder
 locations, required changes to existing code and the build order.
