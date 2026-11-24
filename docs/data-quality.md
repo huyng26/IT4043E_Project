@@ -5,9 +5,12 @@ PM2.5 replay and Spark source-fact projections already validate, normalize,
 resolve revisions and retain rejected records. The shared repair rules (`rules-v1`),
 wrapper/decision/manifest contracts, snapshot profiling, coverage arithmetic and the
 deterministic fault builder (`python -m streaming.quality_replay build`) exist and
-are tested without infrastructure. Group scenarios, Kafka publication, the replay
-topic and dispatcher, the evaluator, quality views and experiments below are not
-implemented, and none of the new code is wired into the live path.
+are tested without infrastructure, as do the missing-interval and
+correction-to-null group scenarios and the local evaluator
+(`python -m streaming.quality_evaluation run`). Flatlines and anomaly warnings,
+Kafka publication, the replay topic and dispatcher, timeliness and restart
+measurements, quality views and the full experiments below are not implemented,
+and none of the new code is wired into the live path.
 The [system design](system-design.md) remains authoritative for the whole system.
 See the [implementation map](data-quality-implementation.md) for placeholder
 locations, required changes to existing code and the build order.

@@ -13,8 +13,11 @@ Wrappers carry only transport fields. Fault labels, original values and expected
 outcomes live exclusively in the manifest. Expected outcomes are written by hand
 for each fault, not derived by running the processing rules.
 
-Out of scope here: group scenarios (missing intervals, flatlines, corrections to
-null) and publication. They are rejected explicitly rather than ignored.
+Group scenarios operate on sensor/hour groups chosen before row mutations, and
+those groups are reserved from the row faults: ``missing_interval`` omits every
+delivery of a group and ``correction_to_null`` adds a later revision that sets the
+group's current value to null. Flatlines and publication are out of scope and are
+rejected or unimplemented explicitly rather than ignored.
 """
 
 import argparse
@@ -29,7 +32,7 @@ from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from models import MeasurementEvent, canonical_json, digest, utc_time
+from models import MeasurementEvent, canonical_json, digest, timestamp, utc_time
 from streaming.quality.contracts import (
     EXPERIMENT_DATASET_KIND,
     MANIFEST_SCHEMA_VERSION,
@@ -38,6 +41,7 @@ from streaming.quality.contracts import (
     sha256_hex,
     validate_manifest,
 )
+from streaming.quality.local_run import read_snapshot_lines
 from streaming.quality.rules import SUPPORTED_RULE_VERSIONS
 
 INJECTOR_VERSION = "injector-v1"
@@ -59,6 +63,11 @@ FAULT_TYPES = (
     "delayed_delivery",
 )
 PROFILES = ("control", "single-fault", "mixed-v1")
+GROUP_SCENARIOS = ("missing_interval", "correction_to_null")
+DEFERRED_SCENARIOS = ("flatline",)  # needs anomaly warnings, which are deferred
+DEFAULT_GROUP_FRACTION = 0.1
+_CORRECTION_LAG = timedelta(hours=1)
+_HOUR = timedelta(hours=1)
 _REPLAY_OFFSET = timezone(timedelta(hours=7))
 _TIME_FIELDS = ("period_start", "period_end", "collected_at", "ingested_at")
 
@@ -222,12 +231,9 @@ def _plan_mutation(fault: str, record: _Input, seed: int) -> _Mutation | None:
 
 
 def _read_snapshot(path: Path) -> tuple[str, list[_Input]]:
-    data = Path(path).read_bytes()
+    snapshot_sha, lines = read_snapshot_lines(path)
     records = []
-    for number, line in enumerate(data.split(b"\n"), 1):
-        raw = line.rstrip(b"\r")
-        if not raw.strip():
-            continue
+    for number, raw in lines:
         envelope = None
         try:
             parsed = json.loads(raw.decode("utf-8"))
@@ -237,7 +243,7 @@ def _read_snapshot(path: Path) -> tuple[str, list[_Input]]:
         except (ValueError, OverflowError):
             pass
         records.append(_Input(number, raw, sha256_hex(raw), envelope))
-    return sha256_hex(data), records
+    return snapshot_sha, records
 
 
 def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -259,8 +265,20 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     fraction = experiment.get("selected_input_fraction")
     if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not 0 <= fraction <= 1:
         raise ValueError("selected_input_fraction must be between 0 and 1")
-    if experiment.get("group_scenarios"):
-        raise ValueError("group scenarios are not implemented")
+    scenarios = list(experiment.get("group_scenarios") or [])
+    deferred = sorted(set(scenarios) & set(DEFERRED_SCENARIOS))
+    if deferred:
+        raise ValueError("group scenarios are not implemented: " + ", ".join(deferred))
+    unknown_scenarios = sorted(set(map(str, scenarios)) - set(GROUP_SCENARIOS))
+    if unknown_scenarios or len(set(scenarios)) != len(scenarios):
+        raise ValueError("group_scenarios must be unique known names: " + ", ".join(unknown_scenarios))
+    group_fraction = experiment.get("group_fraction", DEFAULT_GROUP_FRACTION)
+    if (
+        not isinstance(group_fraction, (int, float))
+        or isinstance(group_fraction, bool)
+        or not 0 <= group_fraction <= 1
+    ):
+        raise ValueError("group_fraction must be between 0 and 1")
     if experiment.get("topic", REPLAY_TOPIC) != REPLAY_TOPIC:
         raise ValueError(f"topic must be {REPLAY_TOPIC}")
     faults = list(experiment.get("fault_types") or [])
@@ -268,6 +286,8 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if unknown or len(set(faults)) != len(faults):
         raise ValueError("fault_types must be unique known fault names: " + ", ".join(unknown))
     if profile == "control":
+        if scenarios:
+            raise ValueError("the control profile cannot include group scenarios")
         faults = []
     elif profile == "single-fault" and len(faults) != 1:
         raise ValueError("single-fault profile requires exactly one fault type")
@@ -279,6 +299,8 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "profile": profile,
         "fraction": fraction,
         "faults": faults,
+        "scenarios": scenarios,
+        "group_fraction": group_fraction,
         "run_id": experiment.get("run_id"),
         "catalog_path": experiment.get("catalog_path"),
         "code_revision": config.get("code_revision"),
@@ -287,6 +309,85 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _select_count(fraction: float, pool: int) -> int:
     return min(pool, math.floor(fraction * pool + 0.5))
+
+
+def _hour_group(record: _Input) -> tuple[str, str, str] | None:
+    """Sensor/hour group of a valid hourly PM2.5 record, else None."""
+    if record.envelope is None:
+        return None
+    start = utc_time(record.envelope["period_start"], "period_start")
+    end = utc_time(record.envelope["period_end"], "period_end")
+    if end - start != _HOUR or start != start.replace(minute=0, second=0, microsecond=0):
+        return None
+    return record.envelope["station_id"], record.envelope["sensor_id"], timestamp(start)
+
+
+def _current_record(records: list[_Input]) -> _Input:
+    return max(
+        records,
+        key=lambda r: (
+            utc_time(r.envelope["collected_at"], "collected_at"),
+            r.envelope.get("revision_hash") or "",
+        ),
+    )
+
+
+def _can_lose_usable_value(record: _Input) -> bool:
+    """Hand-written check that a null correction would remove a usable value."""
+    envelope = record.envelope or {}
+    value = envelope.get("value")
+    return (
+        _is_number(value)
+        and value >= 0
+        and envelope.get("unit") == "ug/m3"
+        and not envelope.get("source_flags")
+    )
+
+
+def _plan_groups(records: list[_Input], settings: dict[str, Any]):
+    """Choose sensor/hour groups before row mutation.
+
+    Returns ``(omitted, corrected, reserved)``: omitted group -> its records,
+    corrected group -> the record being corrected, and the reserved record numbers
+    that row faults must leave alone.
+    """
+    scenarios, seed, fraction = settings["scenarios"], settings["seed"], settings["group_fraction"]
+    groups: dict[tuple[str, str, str], list[_Input]] = {}
+    for record in records:
+        key = _hour_group(record)
+        if key is not None:
+            groups.setdefault(key, []).append(record)
+
+    def ranked(keys, label):
+        return sorted(keys, key=lambda k: (stable_score(seed, canonical_json(list(k)), label), k))
+
+    omitted: dict[tuple[str, str, str], list[_Input]] = {}
+    corrected: dict[tuple[str, str, str], _Input] = {}
+    if "missing_interval" in scenarios:
+        chosen = ranked(groups, "missing_interval")[: _select_count(fraction, len(groups))]
+        omitted = {key: groups[key] for key in sorted(chosen)}
+    if "correction_to_null" in scenarios:
+        eligible = [
+            key
+            for key in groups
+            if key not in omitted and _can_lose_usable_value(_current_record(groups[key]))
+        ]
+        chosen = ranked(eligible, "correction_to_null")[: _select_count(fraction, len(eligible))]
+        corrected = {key: _current_record(groups[key]) for key in sorted(chosen)}
+    reserved = {r.number for rows in omitted.values() for r in rows}
+    reserved |= {r.number for key in corrected for r in groups[key]}
+    return omitted, corrected, reserved
+
+
+def _correction_envelope(record: _Input) -> dict[str, Any]:
+    envelope = dict(record.envelope or {})
+    collected = utc_time(envelope["collected_at"], "collected_at") + _CORRECTION_LAG
+    envelope.update(
+        value=None,
+        collected_at=timestamp(collected),
+        ingested_at=timestamp(collected + timedelta(minutes=1)),
+    )
+    return _with_refreshed_hash(envelope)
 
 
 def _plan(records: list[_Input], settings: dict[str, Any]):
@@ -338,6 +439,8 @@ def _derive_run_id(settings: dict[str, Any], snapshot_sha: str) -> str:
             settings["profile"],
             settings["faults"],
             settings["fraction"],
+            settings["scenarios"],
+            settings["group_fraction"],
             settings["rule_version"],
             INJECTOR_VERSION,
         ]
@@ -362,7 +465,10 @@ def build_replay(
     snapshot_sha, records = _read_snapshot(snapshot_path)
     run_id = _derive_run_id(settings, snapshot_sha)
     seed = settings["seed"]
-    plan, ineligible = _plan(records, settings)
+    omitted, corrected, reserved = _plan_groups(records, settings)
+    plan, ineligible = _plan([r for r in records if r.number not in reserved], settings)
+    omitted_numbers = {r.number for rows in omitted.values() for r in rows}
+    correcting = {record.number: key for key, record in corrected.items()}
 
     newest_end = max(
         (utc_time(r.envelope["period_end"], "period_end") for r in records if r.envelope),
@@ -370,7 +476,10 @@ def build_replay(
     )
     emitted: list[dict[str, Any]] = []
     delayed: list[dict[str, Any]] = []
+    corrections: list[dict[str, Any]] = []
     for record in records:
+        if record.number in omitted_numbers:
+            continue  # missing_interval: no delivery at all for this sensor/hour
         fault, mutation = plan.get(record.number, (None, None))
         ref = {"snapshot_sha256": snapshot_sha, "record_number": record.number}
         payload = record.raw if mutation is None or mutation.payload is None else mutation.payload
@@ -400,6 +509,23 @@ def build_replay(
             delayed.append(entry)
         else:
             emitted.append(entry)
+        if record.number in correcting:
+            corrections.append(
+                {
+                    **entry,
+                    "delivery_id": digest([run_id, record.number, "correction"])[:32],
+                    "role": "correction",
+                    "payload": _json_bytes(_correction_envelope(record)),
+                    "fault": "correction_to_null",
+                    "mutation": {"value": None, "collected_at_lag_hours": _CORRECTION_LAG.total_seconds() / 3600},
+                    "duplicate_of": None,
+                    "expected": {
+                        **_expected(flags=["missing_value"]),
+                        "supersedes": primary_id,
+                        "removes_usable_contribution": True,
+                    },
+                }
+            )
         if fault == "duplicate_delivery":
             emitted.append(
                 {
@@ -413,6 +539,7 @@ def build_replay(
                 }
             )
     emitted.extend(delayed)
+    emitted.extend(corrections)  # a correction is released after everything it corrects
 
     wrappers, deliveries = [], []
     for index, entry in enumerate(emitted):
@@ -465,13 +592,24 @@ def build_replay(
             "config": {
                 "fault_types": settings["faults"],
                 "selected_input_fraction": settings["fraction"],
-                "group_scenarios": [],
+                "group_scenarios": settings["scenarios"],
+                "group_fraction": settings["group_fraction"],
             },
             "input_record_count": len(records),
             "emitted_delivery_count": len(deliveries),
             "fault_counts": dict(sorted(fault_counts.items())),
             "ineligible_selected": ineligible,
-            "omitted_records": [],
+            "omitted_records": [
+                {
+                    "scenario": "missing_interval",
+                    "group": {"station_id": key[0], "sensor_id": key[1], "hour": key[2]},
+                    "record_numbers": [r.number for r in rows],
+                    "source_record_refs": [
+                        {"snapshot_sha256": snapshot_sha, "record_number": r.number} for r in rows
+                    ],
+                }
+                for key, rows in omitted.items()
+            ],
             "deliveries": deliveries,
         }
     )
@@ -496,6 +634,8 @@ def build_replay(
         "emitted_deliveries": len(deliveries),
         "fault_counts": dict(sorted(fault_counts.items())),
         "ineligible_selected": len(ineligible),
+        "omitted_groups": len(omitted),
+        "omitted_records": len(omitted_numbers),
     }
 
 

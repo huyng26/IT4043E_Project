@@ -84,9 +84,23 @@ The [proposed dirty-data processing design](docs/data-quality.md) adds a
 reproducible fault-injection/replay branch, explicit Spark cleaning stages,
 quarantine and quality/coverage reports. It preserves original API data and
 isolates injected faults from live monitoring and primary forecast evaluation.
-The injector and new quality views are planned; current run commands are unchanged.
-Inactive placeholders and the required integration changes are listed in the
-[quality implementation map](docs/data-quality-implementation.md).
+The local part is implemented and needs no services: shared cleaning rules,
+snapshot profiling, a seeded fault injector (including missing-interval and
+correction-to-null scenarios) and an evaluator that scores a corrupted run against
+its unmodified baseline:
+
+```sh
+# copy config/quality.example.json, set "enabled": true, then:
+python3 -m streaming.quality_replay build --config my-quality.json \
+    --snapshot data/frozen.jsonl --output-dir runs/demo
+python3 -m streaming.quality_evaluation run --run-dir runs/demo \
+    --snapshot data/frozen.jsonl
+```
+
+Kafka publication, the isolated Spark job, flatline scenarios and the quality
+views are still planned, and none of this is wired into the live pipeline or the
+existing run commands. Remaining placeholders and the required integration changes
+are listed in the [quality implementation map](docs/data-quality-implementation.md).
 
 Keep small samples in `data/`; store credentials, generated models, checkpoints, and large datasets outside Git. Generated local results belong in the ignored `data/outputs/` directory.
 

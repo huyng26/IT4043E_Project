@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "enabled": false,
+  "enabled": true,
   "rule_version": "rules-v1",
   "experiment": {
     "run_id": null,
@@ -22,6 +22,7 @@
       "delayed_delivery"
     ],
     "group_scenarios": [],
+    "group_fraction": 0.1,
     "topic": "quality_replay_raw",
     "database": null,
     "checkpoint_path": null

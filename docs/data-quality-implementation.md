@@ -1,8 +1,9 @@
 # Dirty-data implementation map
 
-Status: **implementation steps 1–2 done locally; steps 3–6 pending**. Contracts,
-shared rules, profiling, coverage arithmetic and the deterministic fault builder
-are implemented and tested without Kafka, Spark, MongoDB or the network. The
+Status: **implementation steps 1–3 done locally; steps 4–6 pending**. Contracts,
+shared rules, profiling, coverage arithmetic, the deterministic fault builder, two
+group scenarios and the baseline-vs-corrupted evaluator are implemented and tested
+without Kafka, Spark, MongoDB or the network. The
 existing collector, local replay and four-topic Spark consumer still behave as
 before: nothing below is wired into them. Remaining placeholders raise
 `NotImplementedError`; imports perform no network, database, topic or file
@@ -17,9 +18,10 @@ The [quality design](data-quality.md) defines the intended behavior and evaluati
 | [quality/rules.py](../streaming/quality/rules.py) | **Implemented** (`rules-v1`) | `evaluate_payload` and `select_current_decisions`; see [shared rules](#shared-rules-rules-v1). |
 | [quality/profiling.py](../streaming/quality/profiling.py) | **Implemented** | Deterministic profile of a frozen snapshot (+ optional catalog): natural defects by kind, units, periods, duplicates, revisions, cadence, coverage. |
 | [quality/coverage.py](../streaming/quality/coverage.py) | **Implemented** | Catalog parsing, expected hourly sensor-hours and expected/received/usable/missing arithmetic. Unknown cadence yields `null`, not full coverage. |
-| [quality_replay.py](../streaming/quality_replay.py) | `build` **implemented**; `publish_replay` placeholder | Seeded single-fault, `mixed-v1` and control builds writing `replay.jsonl` + evaluator-only `manifest.json`. |
+| [quality/local_run.py](../streaming/quality/local_run.py) | **Implemented** | Manifest-free local processing: snapshot lines or replay wrappers to one saved decision each (results files). It never imports the evaluator or injector. |
+| [quality_replay.py](../streaming/quality_replay.py) | `build` **implemented**; `publish_replay` placeholder | Seeded single-fault, `mixed-v1` and control builds, plus `missing_interval` and `correction_to_null` group scenarios, writing `replay.jsonl` + evaluator-only `manifest.json`. |
 | [quality/dispatcher.py](../streaming/quality/dispatcher.py) | Placeholder | Experiment-only wrapper decoding and executor projection into explicitly isolated storage. |
-| [quality_evaluation.py](../streaming/quality_evaluation.py) | Placeholder | Baseline comparison, repair correctness, precision/recall, false positives, coverage loss and retry/order invariance. Only this side reads expected answers. |
+| [quality_evaluation.py](../streaming/quality_evaluation.py) | **Implemented** (local) | Saved-results comparison with the baseline; see [evaluating a run](#evaluating-a-run). Only this side reads expected answers. |
 | [quality_batch.py](../streaming/quality_batch.py) | Placeholder | Bounded shared-rule rebuilds and quarantine replay from fixed archive cutoffs; validate before publishing a new generation. |
 | [quality_schema.py](../database/quality_schema.py) | Placeholder | Future quality collection validators/indexes; integrate with the existing repository rather than adding a DB client. |
 | [api/quality.py](../api/quality.py) | Placeholder | Future bounded quality-summary router with explicit live or experiment/run scope. No FastAPI app/router exists yet. |
@@ -66,9 +68,53 @@ fault type) and `mixed-v1` (balanced round-robin over the configured faults).
 `single-fault`); natural defects pass through unmutated. Selection uses
 `sha256(seed, record, fault)`; the run ID, delivery IDs, release order and both
 output files are byte-reproducible for the same snapshot, config and code. Outputs
-are created exclusively and an existing run is never overwritten. Group scenarios
-and publication are rejected explicitly. Expected outcomes in the manifest are
-written per fault, not computed by the rules, so the evaluator is not circular.
+are created exclusively and an existing run is never overwritten. Expected outcomes in
+the manifest are written per fault, not computed by the rules, so the evaluator is
+not circular. Publication is unimplemented.
+
+### Group scenarios
+
+Set `experiment.group_scenarios` (and optionally `group_fraction`, default 0.1) to a
+list of `missing_interval` and/or `correction_to_null`. Groups are sensor/hour
+pairs of valid hourly records, ranked by the same stable hash and chosen *before*
+row faults; every record in a chosen group is reserved from the row profile, so no
+compound faults arise. The `control` profile rejects scenarios; `flatline` is
+rejected because it needs the deferred anomaly warnings.
+
+| Scenario | Builder behavior | Manifest record |
+| --- | --- | --- |
+| `missing_interval` | Every delivery of the group is omitted; wrappers carry no trace of it. | `omitted_records` entry with the group and record numbers. |
+| `correction_to_null` | Only groups whose current value is a non-negative, unflagged `ug/m3` number can be chosen. A later revision (`collected_at` +1 h, `value: null`, refreshed hash) is released after every other delivery. | `role: correction`, `fault: correction_to_null`, expected flag `missing_value` and the superseded delivery. |
+
+## Evaluating a run
+
+```sh
+python -m streaming.quality_evaluation run --run-dir runs/<name> \
+    --snapshot data/frozen.jsonl [--catalog catalog.json]
+```
+
+`run` processes the baseline snapshot and the replay through the shared rules
+(`quality/local_run.py`, no manifest access), saves `baseline_results.json` and
+`experiment_results.json` beside the run, and writes
+`evaluation/evaluation.json`. Steps are also available separately
+(`process-baseline`, `process-replay`, `evaluate`). Exit code 0 means every
+assessable check passed, 1 that a check failed, 2 that inputs were unusable or
+did not belong together (different rule version, snapshot or run, or a catalog
+that differs from the one frozen in the manifest). Nothing is overwritten and the
+report is byte-reproducible.
+
+| Report section | What it measures |
+| --- | --- |
+| `accounting` | Planned deliveries equal accepted plus quarantined terminal decisions; missing or unexpected decisions are listed; omissions are counted separately. |
+| `detection` | Per fault type TP/FP/FN, precision and recall from the manifest's expected signal. A zero denominator is `null`. Faults with no processing signal (delay) are `not_applicable` and scored by invariance. |
+| `valid_control` | False positives among unlabeled deliveries whose baseline is clean, and any unlabeled delivery that differs from the baseline. Natural defects are reported under `natural_defects` and never scored. |
+| `repair_correctness` | Repaired identity, period, usability and value against the baseline within `1e-9` ug/m3; wrong and unrepaired counts. |
+| `logical_invariance` | Events that changed other than the destructive ones, destructive faults left usable, corrections that took effect, and stability over seeded delivery shuffles. |
+| `coverage`, `gap_detection` | Expected/received/usable/missing sensor-hours for both runs, lost usable sensor-hours attributed to faults, and unexplained loss or gain. Gap precision/recall needs a catalog; without one it is `not_assessed` and expectations fall back to baseline observations. |
+| `aggregate_effect` | Station-hour mean error where the baseline is fully recoverable; for affected hours, agreement with the baseline minus the destroyed events, plus hours lost. |
+
+Lost data is reported, never reconstructed. `timeliness`, `forecast_robustness`
+and `restart_recovery` are listed as not assessed until the Kafka/Spark path exists.
 
 ## Changes to existing implementation
 
@@ -112,14 +158,15 @@ work for durable batch replay; local frozen JSONL can support the first slice.
    add quality-aware features when the forecast pipeline exists. Optional sensor
    anomaly/neighbor warnings come after the core workflow.
 
-**Done:** steps 1 and 2 (contracts, profiling, shared rules, deterministic
-single-fault/mixed generation, local invariance checks in `tests/test_quality_*.py`).
-**Next:** step 3, `quality_evaluation.py` (baseline comparison, precision/recall,
-lost coverage) plus the grouped gap/delay/correction scenarios. The tests already
-replay generated wrappers through the rules and check manifest expectations; step 3
-turns that into a saved report.
+**Done:** steps 1–3 (contracts, profiling, shared rules, deterministic
+single-fault/mixed generation, missing-interval and correction-to-null scenarios,
+local processing and the saved evaluation report; tests in `tests/test_quality_*.py`).
+**Next:** step 4, persistence and the isolated Kafka/Spark path (wrapper
+dispatcher, experiment launcher with its own database and checkpoint, `publish_replay`).
+Flatline scenarios wait for the deferred anomaly warnings; the evaluator's
+timeliness and restart measurements wait for step 4.
 
-Start with steps 1–3 without Kafka, Spark or public APIs. No placeholder should be
+Steps 1–3 needed no Kafka, Spark or public APIs. No placeholder should be
 treated as a successful no-op: calling an unfinished operation fails explicitly.
 Do not wire these functions into the current startup path until their behavior
 and recovery checks pass.
