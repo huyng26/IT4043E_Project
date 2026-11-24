@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "enabled": true,
+  "enabled": false,
   "rule_version": "rules-v1",
   "experiment": {
     "run_id": null,
