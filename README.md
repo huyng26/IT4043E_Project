@@ -100,7 +100,8 @@ python3 -m streaming.quality_evaluation run --run-dir runs/demo \
 Kafka publication, the isolated Spark job, flatline scenarios and the quality
 views are still planned, and none of this is wired into the live pipeline or the
 existing run commands. Remaining placeholders and the required integration changes
-are listed in the [quality implementation map](docs/data-quality-implementation.md).
+are listed in the [quality implementation map](docs/data-quality-implementation.md);
+the [quality handoff](docs/quality-handoff.md) records progress and the next step.
 
 Keep small samples in `data/`; store credentials, generated models, checkpoints, and large datasets outside Git. Generated local results belong in the ignored `data/outputs/` directory.
 

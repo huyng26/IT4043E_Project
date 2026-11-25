@@ -9,6 +9,8 @@ before: nothing below is wired into them. Remaining placeholders raise
 `NotImplementedError`; imports perform no network, database, topic or file
 writes. The example configuration is `enabled: false` and refuses to run.
 The [quality design](data-quality.md) defines the intended behavior and evaluation.
+**Continuing this work? Start with the [handoff](quality-handoff.md)** for the
+progress table, the next step and the rules that are easy to break.
 
 ## Files and responsibilities
 
