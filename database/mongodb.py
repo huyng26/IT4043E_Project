@@ -617,6 +617,110 @@ class MongoDB:
             upsert=True,
         )
 
+    # Experiment-only quality collections; see database.quality_schema.
+    def initialize_quality(self):
+        """Create the quality collections in a dedicated experiment database.
+
+        Refuses live database names and any database that already holds live
+        collections. A newer recorded quality schema is not downgraded.
+        """
+        from database import quality_schema as quality
+
+        quality.check_experiment_database(self.db.name)
+        self.client.admin.command("ping")
+        live = set(self.db.list_collection_names()) & set(quality.LIVE_MARKER_COLLECTIONS)
+        if live:
+            raise ValueError(
+                f"{self.db.name!r} holds live collections ({', '.join(sorted(live))}); "
+                "use a separate experiment database"
+            )
+        recorded = self.db.control.find_one({"_id": "quality_schema"}) or {}
+        if recorded.get("version", 0) > quality.QUALITY_SCHEMA_VERSION:
+            raise ValueError(
+                f"quality schema {recorded['version']} is newer than this code "
+                f"({quality.QUALITY_SCHEMA_VERSION})"
+            )
+        for collection, rule in quality.VALIDATORS.items():
+            try:
+                self.db.create_collection(
+                    collection, validator=rule, validationLevel="strict"
+                )
+            except CollectionInvalid:
+                self.db.command(
+                    "collMod", collection, validator=rule, validationLevel="strict"
+                )
+        for collection, definitions in quality.INDEXES.items():
+            for keys, options in definitions:
+                self.db[collection].create_index(keys, **options)
+        self.db.control.update_one(
+            {"_id": "quality_schema"},
+            {
+                "$set": {"version": quality.QUALITY_SCHEMA_VERSION, "updated_at": now()},
+                "$setOnInsert": {"initialized_at": now()},
+            },
+            upsert=True,
+        )
+
+    @staticmethod
+    def _insert_once(collection, document):
+        """Insert unless the ``_id`` exists; return the stored document."""
+        fields = {key: value for key, value in document.items() if key != "_id"}
+        return collection.find_one_and_update(
+            {"_id": document["_id"]},
+            {"$setOnInsert": fields},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def save_quality_decision(self, document):
+        """Keep the first decision for a delivery; return what is stored.
+
+        The caller compares the returned ``payload_sha256`` to detect a conflicting
+        redelivery. A retried write is a no-op.
+        """
+        return self._insert_once(self.db.quality_decisions, document)
+
+    def save_quality_receipt(self, document):
+        """Record one Kafka record carrying a delivery; retries are no-ops."""
+        return self._insert_once(self.db.quality_receipts, document)
+
+    def record_quality_rejection(self, document):
+        return self._insert_once(self.db.quality_rejections, document)
+
+    def iter_quality_decisions(self, run_id, rule_version):
+        return self.db.quality_decisions.find(
+            {"run_id": run_id, "rule_version": rule_version}
+        ).sort([("scheduled_release_index", 1), ("_id", 1)])
+
+    def iter_quality_receipts(self, run_id, rule_version):
+        return self.db.quality_receipts.find(
+            {"run_id": run_id, "rule_version": rule_version}
+        ).sort([("delivery_id", 1), ("_id", 1)])
+
+    def iter_quality_rejections(self, run_id, rule_version):
+        return self.db.quality_rejections.find(
+            {"run_id": run_id, "rule_version": rule_version}
+        ).sort("_id", 1)
+
+    def complete_quality_batch(self, query_name, batch_id, offsets, counts):
+        """Record the last finished micro-batch and its outcome counts.
+
+        Counts are per batch (``$set``), so a retried batch does not double them.
+        Durable totals come from the quality collections themselves.
+        """
+        self.db.control.update_one(
+            {"_id": "stream:" + query_name},
+            {
+                "$set": {
+                    "batch_id": batch_id,
+                    "offsets": offsets,
+                    "counts": {key: int(value) for key, value in counts.items()},
+                    "completed_at": now(),
+                }
+            },
+            upsert=True,
+        )
+
     def set_state(self, key, **fields):
         self.db.control.update_one(
             {"_id": key}, {"$set": {**fields, "updated_at": now()}}, upsert=True

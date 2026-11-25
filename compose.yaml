@@ -21,7 +21,7 @@ services:
 
   kafka:
     image: apache/kafka:3.9.1
-    profiles: ["kafka", "collectors", "pipeline"]
+    profiles: ["kafka", "collectors", "pipeline", "quality"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:9092:9092"
@@ -52,7 +52,7 @@ services:
 
   kafka-init:
     image: apache/kafka:3.9.1
-    profiles: ["kafka", "collectors", "pipeline"]
+    profiles: ["kafka", "collectors", "pipeline", "quality"]
     depends_on:
       kafka:
         condition: service_healthy
@@ -63,6 +63,8 @@ services:
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic weather_raw --partitions 3 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic air_quality_latest --partitions 3 --replication-factor 1 --config retention.ms=604800000
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic source_catalog --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        # Experiment-only replay topic: short retention, never read by the live job.
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic quality_replay_raw --partitions 3 --replication-factor 1 --config retention.ms=86400000
 
   crawler:
     image: urban-air-quality-crawler:local
@@ -113,7 +115,34 @@ services:
         condition: service_completed_successfully
     stop_grace_period: 60s
 
+  # Dirty-data experiments only: `docker compose --profile quality run --rm
+  # quality-spark --run-id <run_id> --available-now`. Never part of `pipeline`.
+  quality-spark:
+    image: urban-air-quality-spark:local
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    profiles: ["quality"]
+    init: true
+    entrypoint: ["python", "-m", "streaming.quality_spark"]
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      QUALITY_MONGO_DATABASE: ${QUALITY_MONGO_DATABASE:-urban_air_quality_quality}
+      MONGO_DATABASE: ${MONGO_DATABASE:-urban_air_quality}
+      MONGO_COLLECTOR_DATABASE: ${MONGO_COLLECTOR_DATABASE:-urban_air_quality_collector}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      QUALITY_CHECKPOINT_ROOT: /checkpoints/quality
+      SPARK_LOCAL_IP: 127.0.0.1
+    volumes:
+      - quality_checkpoints:/checkpoints
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
 volumes:
   mongodb_data:
   kafka_data:
   spark_checkpoints:
+  quality_checkpoints:

@@ -4,10 +4,11 @@
 the seed, the input record and the fault name (never Python's ``hash()``), writes
 processor-facing wrappers to ``replay.jsonl`` and the evaluator-only
 ``manifest.json``, and never touches the snapshot, the network, Kafka or a
-database. Publication is a separate, still unimplemented step::
+database. Publication to the experiment Kafka topic is a separate command::
 
     python3 -m streaming.quality_replay build --config quality.json \\
         --snapshot data/frozen.jsonl --output-dir runs/<run>
+    python3 -m streaming.quality_replay publish --run-dir runs/<run>
 
 Wrappers carry only transport fields. Fault labels, original values and expected
 outcomes live exclusively in the manifest. Expected outcomes are written by hand
@@ -16,8 +17,8 @@ for each fault, not derived by running the processing rules.
 Group scenarios operate on sensor/hour groups chosen before row mutations, and
 those groups are reserved from the row faults: ``missing_interval`` omits every
 delivery of a group and ``correction_to_null`` adds a later revision that sets the
-group's current value to null. Flatlines and publication are out of scope and are
-rejected or unimplemented explicitly rather than ignored.
+group's current value to null. Flatlines are out of scope and are rejected
+explicitly rather than ignored.
 """
 
 import argparse
@@ -28,7 +29,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from streaming.quality.contracts import (
     build_wrapper,
     sha256_hex,
     validate_manifest,
+    validate_wrapper,
 )
 from streaming.quality.local_run import read_snapshot_lines
 from streaming.quality.rules import SUPPORTED_RULE_VERSIONS
@@ -639,14 +641,126 @@ def build_replay(
     }
 
 
-def publish_replay(replay_path: Path, *, bootstrap_servers: str) -> None:
-    """TODO: publish prebuilt wrappers with KafkaManager and record broker ACKs.
+PUBLICATIONS_DIR = "publications"
+PUBLISH_ATTEMPTS = 3
 
-    Use only quality_replay_raw. Preserve delivery IDs/bytes on retry, record
-    actual transport attempts separately and honor the stored release schedule.
-    Provision the experiment topic separately from this producer.
+
+def _ack_field(metadata: Any, name: str) -> Any:
+    return metadata[name] if isinstance(metadata, Mapping) else getattr(metadata, name)
+
+
+def _published_now() -> str:
+    return timestamp(datetime.now(timezone.utc))
+
+
+def publish_replay(
+    run_path: Path,
+    *,
+    bootstrap_servers: str | None = None,
+    topic: str = REPLAY_TOPIC,
+    manager_factory: Any = None,
+    clock: Any = _published_now,
+    max_attempts: int = PUBLISH_ATTEMPTS,
+) -> dict[str, Any]:
+    """Publish a built run's wrappers to the experiment topic and log broker ACKs.
+
+    ``run_path`` is a run directory (or its ``replay.jsonl``). Wrappers are sent in
+    ``scheduled_release_index`` order, one at a time, each waiting for its ACK, so
+    the release schedule holds per partition. ``published_at`` is stamped once per
+    wrapper; a failed send is retried with the same bytes. Delivery IDs never
+    change, so publishing the same run again is a repeated-publication experiment,
+    not new data. Each call writes ``publications/publication-NNN.json`` (never
+    overwritten); a failed call still writes its log before raising.
+
+    The topic is created by ``kafka-init`` (compose), not here; only
+    ``quality_replay*`` topics are accepted so live topics cannot be targeted.
     """
-    raise NotImplementedError("Experiment Kafka publication is not implemented")
+    if not isinstance(topic, str) or not topic.startswith(REPLAY_TOPIC):
+        raise ValueError(f"replay wrappers may only be published to {REPLAY_TOPIC}* topics")
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    run_path = Path(run_path)
+    replay_path = run_path / REPLAY_FILE if run_path.is_dir() else run_path
+    data = replay_path.read_bytes()
+    wrappers = []
+    for line_number, line in enumerate(data.split(b"\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            wrappers.append(validate_wrapper(json.loads(line.decode("utf-8"))))
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError(f"replay line {line_number} is not a valid wrapper: {error}") from error
+    if not wrappers:
+        raise ValueError("replay contains no wrappers")
+    run_ids = {w["run_id"] for w in wrappers}
+    if len(run_ids) != 1:
+        raise ValueError("replay mixes several run IDs")
+    indexes = [w["scheduled_release_index"] for w in wrappers]
+    if len(set(indexes)) != len(indexes):
+        raise ValueError("scheduled_release_index values must be unique")
+    if len({w["delivery_id"] for w in wrappers}) != len(wrappers):
+        raise ValueError("replay contains duplicate delivery IDs")
+    wrappers.sort(key=lambda w: w["scheduled_release_index"])
+
+    log_directory = replay_path.parent / PUBLICATIONS_DIR
+    log_directory.mkdir(exist_ok=True)
+    number = len(list(log_directory.glob("publication-*.json"))) + 1
+    log: dict[str, Any] = {
+        "schema_version": 1,
+        "publication": number,
+        "run_id": next(iter(run_ids)),
+        "replay_sha256": sha256_hex(data),
+        "topic": topic,
+        "started_at": clock(),
+        "finished_at": None,
+        "planned": len(wrappers),
+        "acknowledged": 0,
+        "retried_sends": 0,
+        "error": None,
+        "acks": [],
+    }
+    if manager_factory is None:
+        from streaming.kafka import KafkaManager
+
+        manager_factory = KafkaManager
+    try:
+        with manager_factory(bootstrap_servers) as manager:
+            for wrapper in wrappers:
+                message = validate_wrapper({**wrapper, "published_at": clock()})
+                key = message["original_key"] or message["delivery_id"]
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        metadata = manager.publish(topic, key=key, value=message)
+                        break
+                    except Exception as error:  # broker/transport failure: same bytes again
+                        if attempt == max_attempts:
+                            raise RuntimeError(
+                                f"delivery {message['delivery_id']} failed after "
+                                f"{attempt} attempts: {error}"
+                            ) from error
+                        log["retried_sends"] += 1
+                log["acks"].append(
+                    {
+                        "delivery_id": message["delivery_id"],
+                        "scheduled_release_index": message["scheduled_release_index"],
+                        "published_at": message["published_at"],
+                        "attempts": attempt,
+                        "partition": _ack_field(metadata, "partition"),
+                        "offset": _ack_field(metadata, "offset"),
+                    }
+                )
+                log["acknowledged"] += 1
+    except Exception as error:
+        log["error"] = str(error)
+        raise
+    finally:
+        log["finished_at"] = clock()
+        path = log_directory / f"publication-{number:03d}.json"
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(log, indent=2, sort_keys=True) + "\n")
+    return {key: log[key] for key in ("publication", "run_id", "topic", "planned", "acknowledged", "retried_sends")} | {
+        "log_path": str(path)
+    }
 
 
 def _code_revision() -> str | None:
@@ -665,24 +779,33 @@ def _code_revision() -> str | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run ``build``. Publication has no command until it is implemented."""
+    """Run ``build`` or ``publish``."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     build = commands.add_parser("build", help="write replay wrappers and the evaluator manifest")
     build.add_argument("--config", type=Path, required=True, help="explicitly enabled quality JSON config")
     build.add_argument("--snapshot", type=Path, help="frozen JSONL (default: experiment.snapshot_path)")
     build.add_argument("--output-dir", type=Path, help="new run directory (default: experiment.output_directory)")
+    publish = commands.add_parser("publish", help="send a built run's wrappers to the experiment Kafka topic")
+    publish.add_argument("--run-dir", type=Path, required=True, help="directory written by build")
+    publish.add_argument("--bootstrap-servers", help="default: KAFKA_BOOTSTRAP_SERVERS or 127.0.0.1:9092")
+    publish.add_argument("--topic", default=REPLAY_TOPIC)
     args = parser.parse_args(argv)
     try:
-        config = json.loads(args.config.read_text(encoding="utf-8"))
-        experiment = config.get("experiment") or {}
-        snapshot = args.snapshot or experiment.get("snapshot_path")
-        output = args.output_dir or experiment.get("output_directory")
-        if not snapshot or not output:
-            parser.error("--snapshot and --output-dir are required unless set in the config")
-        config = {**config, "code_revision": config.get("code_revision") or _code_revision()}
-        summary = build_replay(Path(snapshot), Path(output), config=config)
-    except (OSError, ValueError) as error:
+        if args.command == "publish":
+            summary = publish_replay(
+                args.run_dir, bootstrap_servers=args.bootstrap_servers, topic=args.topic
+            )
+        else:
+            config = json.loads(args.config.read_text(encoding="utf-8"))
+            experiment = config.get("experiment") or {}
+            snapshot = args.snapshot or experiment.get("snapshot_path")
+            output = args.output_dir or experiment.get("output_directory")
+            if not snapshot or not output:
+                parser.error("--snapshot and --output-dir are required unless set in the config")
+            config = {**config, "code_revision": config.get("code_revision") or _code_revision()}
+            summary = build_replay(Path(snapshot), Path(output), config=config)
+    except (OSError, ValueError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(json.dumps(summary, indent=2, sort_keys=True))

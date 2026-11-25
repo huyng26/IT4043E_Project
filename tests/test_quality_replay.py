@@ -24,7 +24,6 @@ from streaming.quality.rules import (
 from streaming.quality_replay import (
     FAULT_TYPES,
     build_replay,
-    publish_replay,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,10 +135,6 @@ class ControlAndDeterminismTests(ReplayCase):
             with self.subTest(name), self.assertRaises(ValueError):
                 build_replay(self.snapshot, out, config=config)
         self.assertFalse(out.exists())
-
-    def test_publication_is_still_an_explicit_placeholder(self):
-        with self.assertRaises(NotImplementedError):
-            publish_replay(self.dir / "replay.jsonl", bootstrap_servers="localhost:9092")
 
 
 class SingleFaultTests(ReplayCase):

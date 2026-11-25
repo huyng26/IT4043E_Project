@@ -1,11 +1,14 @@
 # Dirty-data implementation map
 
-Status: **implementation steps 1–3 done locally; steps 4–6 pending**. Contracts,
+Status: **implementation steps 1–4 done; steps 5–6 pending**. Contracts,
 shared rules, profiling, coverage arithmetic, the deterministic fault builder, two
-group scenarios and the baseline-vs-corrupted evaluator are implemented and tested
-without Kafka, Spark, MongoDB or the network. The
-existing collector, local replay and four-topic Spark consumer still behave as
-before: nothing below is wired into them. Remaining placeholders raise
+group scenarios and the baseline-vs-corrupted evaluator run without services.
+Step 4 adds the isolated transport path: `publish` to the `quality_replay_raw`
+topic, the wrapper dispatcher, experiment-only MongoDB collections and a separate
+Spark job (`streaming.quality_spark`, compose profile `quality`), whose stored
+decisions are exported and graded by the same evaluator. The existing collector,
+local replay and four-topic live Spark consumer still behave as before: nothing
+below is wired into them. Remaining placeholders raise
 `NotImplementedError`; imports perform no network, database, topic or file
 writes. The example configuration is `enabled: false` and refuses to run.
 The [quality design](data-quality.md) defines the intended behavior and evaluation.
@@ -21,17 +24,19 @@ progress table, the next step and the rules that are easy to break.
 | [quality/profiling.py](../streaming/quality/profiling.py) | **Implemented** | Deterministic profile of a frozen snapshot (+ optional catalog): natural defects by kind, units, periods, duplicates, revisions, cadence, coverage. |
 | [quality/coverage.py](../streaming/quality/coverage.py) | **Implemented** | Catalog parsing, expected hourly sensor-hours and expected/received/usable/missing arithmetic. Unknown cadence yields `null`, not full coverage. |
 | [quality/local_run.py](../streaming/quality/local_run.py) | **Implemented** | Manifest-free local processing: snapshot lines or replay wrappers to one saved decision each (results files). It never imports the evaluator or injector. |
-| [quality_replay.py](../streaming/quality_replay.py) | `build` **implemented**; `publish_replay` placeholder | Seeded single-fault, `mixed-v1` and control builds, plus `missing_interval` and `correction_to_null` group scenarios, writing `replay.jsonl` + evaluator-only `manifest.json`. |
-| [quality/dispatcher.py](../streaming/quality/dispatcher.py) | Placeholder | Experiment-only wrapper decoding and executor projection into explicitly isolated storage. |
+| [quality_replay.py](../streaming/quality_replay.py) | **Implemented** (`build`, `publish`) | Seeded single-fault, `mixed-v1` and control builds, plus `missing_interval` and `correction_to_null` group scenarios, writing `replay.jsonl` + evaluator-only `manifest.json`. `publish` sends wrappers in release order to `quality_replay*` topics only and logs every broker ACK. |
+| [quality/dispatcher.py](../streaming/quality/dispatcher.py) | **Implemented** | Experiment-only Kafka-record handling: wrapper check, shared rules, retry-safe decision/receipt writes, rejections with raw bytes, other runs skipped. See [transport path](#transport-path-step-4). |
+| [quality_spark.py](../streaming/quality_spark.py) | **Implemented** | Separate Spark job: subscribes only to the replay topic, own checkpoint per run, experiment database only. |
 | [quality_evaluation.py](../streaming/quality_evaluation.py) | **Implemented** (local) | Saved-results comparison with the baseline; see [evaluating a run](#evaluating-a-run). Only this side reads expected answers. |
 | [quality_batch.py](../streaming/quality_batch.py) | Placeholder | Bounded shared-rule rebuilds and quarantine replay from fixed archive cutoffs; validate before publishing a new generation. |
-| [quality_schema.py](../database/quality_schema.py) | Placeholder | Future quality collection validators/indexes; integrate with the existing repository rather than adding a DB client. |
+| [quality_schema.py](../database/quality_schema.py) | **Implemented** (quality schema 1) | Validators/indexes for `quality_decisions`, `quality_receipts`, `quality_rejections` and the live-database guard. Applied by `MongoDB.initialize_quality`; no new client. |
 | [api/quality.py](../api/quality.py) | Placeholder | Future bounded quality-summary router with explicit live or experiment/run scope. No FastAPI app/router exists yet. |
 | [dashboard/quality/README.md](../dashboard/quality/README.md) | Requirements only | Quality panel requirements until the React application exists. |
 | [quality_features.py](../ml/quality_features.py) | Placeholder | Future coverage/missingness/age features with availability-aware inputs and training-only feature imputation. |
 | [quality.example.json](../config/quality.example.json) | Draft, disabled | Configuration read by `quality_replay build`; set `enabled: true` in a copy to run. |
 
-The decision/dispatcher/storage interfaces are still drafts. `api/` and `ml/`
+Live quality writes (decisions for the four live topics) are still not designed in
+code; the experiment collections are separate. `api/` and `ml/`
 remain outside the current setuptools package list; add their packaging and
 dependencies when those services are built.
 
@@ -39,8 +44,9 @@ dependencies when those services are built.
 
 `evaluate_payload(payload, source_topic=..., rule_version=...)` returns one
 decision per received payload and reuses `models`/`streaming.measurements` for
-identity, revision hash, unit factors and flags. Only `air_quality_raw` PM2.5 is
-supported; other topics or unknown rule versions raise `ValueError`.
+identity, revision hash, unit factors and flags. Only the `air_quality_raw` topic is
+supported; other topics or unknown rule versions raise `ValueError`. PM2.5 gets the
+full value rules; other pollutants are accepted with a flag (below).
 
 | Input | Outcome |
 | --- | --- |
@@ -49,7 +55,8 @@ supported; other topics or unknown rule versions raise `ValueError`.
 | Non-UTC offset | Same UTC instant and identity; action `timestamp_normalized_to_utc`. A timestamp without an offset is quarantined (`missing_timezone`). |
 | `µg/m³`, `μg/m³`, `mg/m3` | Action `unit_alias_normalized` / `unit_converted_to_ug_m3`, only when a concentration exists. Received value and unit are retained. `ppm` etc. are flagged, not converted. |
 | Claimed `event_id`/`revision_hash` | Must match the content **after** representation repair, otherwise `integrity_mismatch`. Absent hashes are allowed for local fixtures; the live path still requires them. |
-| Bad UTF-8/JSON, non-object, `status: rejected`, missing field, other schema failure, non-PM2.5 | `quarantined` with a reason and a null identity, so it cannot retract an observation. |
+| Other pollutant (`no2`, `pm10`, ...) | `accepted` with flag `unsupported_pollutant` (plus `missing_value`/`source_flagged` like the live path), never usable, no unit conversion. Structure and claimed hashes are checked with the live identity formula. Matches how the live path stores them. |
+| Bad UTF-8/JSON, non-object, `status: rejected`, missing field, other schema failure | `quarantined` with a reason and a null identity, so it cannot retract an observation. |
 
 `select_current_decisions` mirrors `current_measurements` (greatest
 `(collected_at, revision_hash)`, then `ingested_at`) before usability filtering, so a
@@ -115,8 +122,50 @@ report is byte-reproducible.
 | `coverage`, `gap_detection` | Expected/received/usable/missing sensor-hours for both runs, lost usable sensor-hours attributed to faults, and unexplained loss or gain. Gap precision/recall needs a catalog; without one it is `not_assessed` and expectations fall back to baseline observations. |
 | `aggregate_effect` | Station-hour mean error where the baseline is fully recoverable; for affected hours, agreement with the baseline minus the destroyed events, plus hours lost. |
 
-Lost data is reported, never reconstructed. `timeliness`, `forecast_robustness`
-and `restart_recovery` are listed as not assessed until the Kafka/Spark path exists.
+Lost data is reported, never reconstructed. Local runs list `timeliness`,
+`forecast_robustness` and `restart_recovery` as not assessed; a graded Spark-path
+run adds a `transport` section and timeliness (below).
+
+## Transport path (step 4)
+
+```sh
+docker compose --profile quality up -d --wait mongodb kafka && \
+    docker compose --profile quality up kafka-init       # creates quality_replay_raw (1-day retention)
+python -m streaming.quality_replay publish --run-dir runs/<name>
+docker compose --profile quality run --rm quality-spark --run-id <run_id> --available-now
+python -m streaming.quality_evaluation spark-run --run-dir runs/<name> \
+    --snapshot data/frozen.jsonl --database urban_air_quality_quality [--catalog catalog.json]
+```
+
+* **Publication** sends wrappers one at a time in `scheduled_release_index` order,
+  waiting for each ACK, stamps `published_at` once per wrapper and retries a failed
+  send with the same bytes. Each call writes `publications/publication-NNN.json`
+  (ACK partition/offset per delivery). Publishing a run again is a
+  repeated-publication test: delivery IDs never change.
+* **Dispatch** (`quality/dispatcher.py`): a wrapper that breaks the transport
+  contract (bad JSON, unknown field, SHA-256 mismatch, wrong topic) is a
+  `quality_rejections` row with raw key/value bytes. A malformed *inner* payload is
+  a normal quarantine decision. Wrappers of another run are skipped and counted.
+  The decision is inserted once per `(run_id, delivery_id, rule_version)` and
+  stored as canonical JSON; every Kafka record is one `quality_receipts` row keyed
+  by topic/partition/offset. A Spark retry therefore changes nothing, and a
+  second publication adds receipts but no decisions. The same delivery ID with
+  different bytes is a `conflicting_redelivery` rejection. Write failures propagate
+  so Spark retries.
+* **Isolation**: `check_experiment_database` refuses the configured live serving and
+  collector database names; `initialize_quality` also refuses any database that
+  holds live collections. The job reads only `quality_replay*` topics, refuses the
+  live checkpoint and defaults to `<checkpoint-root>/<run_id>`. `processing.TOPICS`
+  is unchanged and the compose service is only in the `quality` profile.
+* **Grading**: `export` turns stored decisions into the same
+  `experiment_results.json` as local processing and writes `transport.json`
+  (decided vs planned deliveries, ACKed records not processed, redeliveries,
+  rejections by reason, `processed_at - published_at` latency p50/p95/max).
+  `spark-run` writes everything under `<run>/spark/` and evaluates with
+  `--transport`, which adds `transport_*` checks and removes timeliness from
+  `not_assessed`. Latency includes Spark's trigger interval and job startup.
+  Restart recovery is still a manual procedure: stop the job mid-run, start it
+  again, and the transport checks show any loss or duplication.
 
 ## Changes to existing implementation
 
@@ -129,7 +178,7 @@ and `restart_recovery` are listed as not assessed until the Kafka/Spark path exi
 | [streaming/spark.py](../streaming/spark.py) | Add a separately selected experiment entry point/configuration with its own database and checkpoint, reusing execution mechanics. Continue executor-side processing and failed-write retry behavior. |
 | [database/documents.py](../database/documents.py) | Align normalized/quality projections with shared decisions; preserve received payloads, revision guards and original/derived hashes. |
 | [database/schema.py](../database/schema.py) and [mongodb.py](../database/mongodb.py) | Integrate quality validators/indexes, deterministic decision upserts, recomputed summaries and bounded reads through `MongoDB`. Add migration/version handling before enabling new writes. |
-| [compose.yaml](../compose.yaml) and future `infra/` manifests | Provision the replay topic and explicitly opted-in experiment job/resources only once dispatcher/storage isolation work. Do not subscribe the current live writer to replay wrappers. |
+| [compose.yaml](../compose.yaml) and future `infra/` manifests | **Done for compose:** `kafka-init` creates `quality_replay_raw`; `quality-spark` exists only in the `quality` profile with its own checkpoint volume. Future `infra/` manifests need the same separation. |
 | [tests/test_replay.py](../tests/test_replay.py) | Keep current regression checks; add behavior-focused quality and integration tests as implementations arrive. |
 
 Collectors continue to capture original responses and source envelopes. Dirty
@@ -160,15 +209,15 @@ work for durable batch replay; local frozen JSONL can support the first slice.
    add quality-aware features when the forecast pipeline exists. Optional sensor
    anomaly/neighbor warnings come after the core workflow.
 
-**Done:** steps 1–3 (contracts, profiling, shared rules, deterministic
+**Done:** steps 1–4 (contracts, profiling, shared rules, deterministic
 single-fault/mixed generation, missing-interval and correction-to-null scenarios,
-local processing and the saved evaluation report; tests in `tests/test_quality_*.py`).
-**Next:** step 4, persistence and the isolated Kafka/Spark path (wrapper
-dispatcher, experiment launcher with its own database and checkpoint, `publish_replay`).
-Flatline scenarios wait for the deferred anomaly warnings; the evaluator's
-timeliness and restart measurements wait for step 4.
+local processing, the saved evaluation report, publication, dispatcher, experiment
+collections, the isolated Spark job and transport grading; tests in
+`tests/test_quality_*.py`). **Next:** step 5 needs HDFS and the batch layer from the
+main plan. Flatline scenarios wait for the deferred anomaly warnings.
 
-Steps 1–3 needed no Kafka, Spark or public APIs. No placeholder should be
+Steps 1–3 need no Kafka, Spark or public APIs; step 4's logic is tested with fakes
+and verified end to end with the compose `quality` profile. No placeholder should be
 treated as a successful no-op: calling an unfinished operation fails explicitly.
 Do not wire these functions into the current startup path until their behavior
 and recovery checks pass.

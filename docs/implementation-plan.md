@@ -4,11 +4,12 @@ The [detailed system design](system-design.md) defines the agreed stack: Kafka, 
 
 The proposed [dirty-data extension](data-quality.md) adds quality profiling,
 controlled fault injection, shared cleaning rules and measurable quality outputs.
-Its first three build steps are implemented locally (contracts, profiling, shared
-rules, deterministic single-fault/mixed replay builder, missing-interval and
-correction-to-null scenarios, and a baseline-vs-corrupted evaluator); flatlines,
-Kafka/Spark isolation and batch reconciliation are still placeholders, and
-existing commands do not run the injector. Follow the
+Its first four build steps are implemented: contracts, profiling, shared rules,
+the deterministic single-fault/mixed replay builder, missing-interval and
+correction-to-null scenarios, a baseline-vs-corrupted evaluator, and the isolated
+Kafka topic, dispatcher, experiment database and Spark job (compose profile
+`quality`). Flatlines and batch reconciliation are still placeholders, and the
+live pipeline commands do not run the injector. Follow the
 [implementation map](data-quality-implementation.md) for status and next steps.
 
 ## Start coding during milestone 1

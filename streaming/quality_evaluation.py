@@ -11,8 +11,13 @@ processing side produces *results files* without seeing a manifest
 The report is deterministic: the same inputs give byte-identical JSON. It scores
 detection, repair correctness, valid-control false positives, logical invariance,
 coverage loss and aggregate effect. Lost data is reported, never reconstructed from
-the manifest. Timeliness and forecast robustness need the Kafka/Spark path and are
-listed as not assessed.
+the manifest. Forecast robustness and restart recovery are listed as not assessed.
+
+Results from the Kafka/Spark path are exported from the experiment database and
+graded the same way; a transport summary adds timeliness and delivery checks::
+
+    python3 -m streaming.quality_evaluation spark-run --run-dir runs/<run> \\
+        --snapshot data/frozen.jsonl --database urban_air_quality_quality
 """
 
 import argparse
@@ -32,7 +37,9 @@ from streaming.quality.local_run import (
     load_results,
     process_replay,
     process_snapshot,
+    results_from_store,
     save_results,
+    transport_summary,
 )
 from streaming.quality.rules import RULE_VERSION, select_current_decisions
 
@@ -43,11 +50,23 @@ MAX_EXAMPLES = 5
 REPORT_FILE = "evaluation.json"
 BASELINE_RESULTS_FILE = "baseline_results.json"
 EXPERIMENT_RESULTS_FILE = "experiment_results.json"
+TRANSPORT_FILE = "transport.json"
+SPARK_DIR = "spark"
 NOT_ASSESSED = {
     "timeliness": "needs publish/process timestamps from the Kafka and Spark path",
     "forecast_robustness": "needs the forecast pipeline, which does not exist yet",
-    "restart_recovery": "needs a stoppable consumer; this run replays a file locally",
+    "restart_recovery": (
+        "not measured automatically; stop and restart the quality Spark job during a "
+        "run, then the transport checks show whether anything was lost or duplicated"
+    ),
 }
+TRANSPORT_CHECKS = (
+    "every_planned_delivery_decided",
+    "one_decision_per_delivery",
+    "every_acknowledged_record_processed",
+    "no_conflicting_redeliveries",
+    "no_invalid_wrappers",
+)
 
 
 # --- Small helpers --------------------------------------------------------
@@ -172,8 +191,12 @@ def evaluate_run(
     experiment_results_path: Path,
     output_directory: Path,
     catalog_path: Path | None = None,
+    transport_path: Path | None = None,
 ) -> dict[str, Any]:
     """Compare results against the baseline and save ``evaluation.json``.
+
+    With ``transport_path`` (from the Kafka/Spark path) the report adds a
+    ``transport`` section, its checks, and timeliness.
 
     Raises ``ValueError`` when the inputs do not belong together (different rule
     version, snapshot or run). Missing or unexpected deliveries do not raise: they
@@ -184,6 +207,17 @@ def evaluate_run(
     experiment: Any = load_results(experiment_results_path, kind="experiment")
     _check_compatibility(manifest, baseline, experiment)
     sensors = _load_catalog(catalog_path, manifest)
+    transport = None
+    if transport_path is not None:
+        transport = json.loads(Path(transport_path).read_text(encoding="utf-8"))
+        if not isinstance(transport, dict) or transport.get("schema_version") != 1:
+            raise ValueError(f"{transport_path} is not a schema-1 transport summary")
+        if transport.get("run_id") != manifest["run_id"]:
+            raise ValueError("transport summary belongs to a different run")
+        if transport.get("rule_version") != manifest["rule_version"]:
+            raise ValueError("transport summary uses a different rule version")
+        if transport.get("replay_sha256") != experiment["input"]["sha256"]:
+            raise ValueError("transport summary and experiment results describe different replays")
 
     base: dict[int, dict[str, Any]] = {row["key"]: row["decision"] for row in baseline["decisions"]}
     exp: dict[str, dict[str, Any]] = {row["key"]: row["decision"] for row in experiment["decisions"]}
@@ -525,6 +559,11 @@ def evaluate_run(
         "aggregate_matches_baseline_where_recoverable": aggregate["recoverable_mismatches"] == 0
         and affected_mismatch == 0,
     }
+    not_assessed = dict(NOT_ASSESSED)
+    if transport is not None:
+        for name in TRANSPORT_CHECKS:
+            checks[f"transport_{name}"] = transport["checks"][name]
+        del not_assessed["timeliness"]
     quarantine_examples = [
         {
             "delivery_id": d["delivery_id"],
@@ -553,6 +592,9 @@ def evaluate_run(
             "baseline_results_sha256": sha256_hex(Path(baseline_results_path).read_bytes()),
             "experiment_results_sha256": sha256_hex(Path(experiment_results_path).read_bytes()),
             "catalog_used": sensors is not None,
+            "transport_sha256": None
+            if transport_path is None
+            else sha256_hex(Path(transport_path).read_bytes()),
         },
         "checks": checks,
         "passed": all(value for value in checks.values() if value is not None),
@@ -569,7 +611,8 @@ def evaluate_run(
         "coverage": coverage,
         "gap_detection": gap,
         "aggregate_effect": aggregate,
-        "not_assessed": NOT_ASSESSED,
+        "transport": transport,
+        "not_assessed": not_assessed,
         "examples": {
             "repairs": _bounded(repair_examples),
             "wrong_repairs": _bounded(wrong_examples),
@@ -603,6 +646,64 @@ def _run(run_dir: Path, snapshot: Path, catalog: Path | None) -> dict[str, Any]:
     )
 
 
+def export_store(repository: Any, run_dir: Path, output_dir: Path) -> dict[str, Any]:
+    """Write experiment results and the transport summary from the experiment store.
+
+    ``repository`` is a ``database.MongoDB`` on the experiment database. Reads only
+    the run ID and rule version from the manifest; the stored decisions are never
+    compared with it here.
+    """
+    manifest: Any = validate_manifest(json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")))
+    run_id, rule_version = str(manifest["run_id"]), str(manifest["rule_version"])
+    replay = run_dir / "replay.jsonl"
+    decisions = list(repository.iter_quality_decisions(run_id, rule_version))
+    publications = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((run_dir / "publications").glob("publication-*.json"))
+    ]
+    results = results_from_store(decisions, replay_path=replay, rule_version=rule_version)
+    transport = transport_summary(
+        replay_path=replay,
+        rule_version=rule_version,
+        decisions=decisions,
+        receipts=repository.iter_quality_receipts(run_id, rule_version),
+        rejections=repository.iter_quality_rejections(run_id, rule_version),
+        publications=publications,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_results(results, output_dir / EXPERIMENT_RESULTS_FILE)
+    with (output_dir / TRANSPORT_FILE).open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(transport, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    return transport
+
+
+def _spark_run(run_dir: Path, snapshot: Path, catalog: Path | None, repository: Any) -> dict[str, Any]:
+    manifest: Any = validate_manifest(json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")))
+    out = run_dir / SPARK_DIR
+    if out.exists():
+        raise FileExistsError(f"refusing to overwrite existing results: {out}")
+    export_store(repository, run_dir, out)
+    save_results(
+        process_snapshot(snapshot, rule_version=str(manifest["rule_version"])),
+        out / BASELINE_RESULTS_FILE,
+    )
+    return evaluate_run(
+        manifest_path=run_dir / "manifest.json",
+        baseline_results_path=out / BASELINE_RESULTS_FILE,
+        experiment_results_path=out / EXPERIMENT_RESULTS_FILE,
+        output_directory=out / "evaluation",
+        catalog_path=catalog,
+        transport_path=out / TRANSPORT_FILE,
+    )
+
+
+def _open_experiment_store(mongo_uri: str | None, database: str):
+    from database import MongoDB
+    from database.quality_schema import check_experiment_database
+
+    return MongoDB(mongo_uri, check_experiment_database(database))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -620,10 +721,24 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--experiment", type=Path, required=True)
     evaluate.add_argument("--output-dir", type=Path, required=True)
     evaluate.add_argument("--catalog", type=Path)
-    run = commands.add_parser("run", help="process baseline and replay, then evaluate")
+    evaluate.add_argument("--transport", type=Path, help="transport.json from export")
+    run = commands.add_parser("run", help="process baseline and replay locally, then evaluate")
     run.add_argument("--run-dir", type=Path, required=True, help="directory written by quality_replay build")
     run.add_argument("--snapshot", type=Path, required=True)
     run.add_argument("--catalog", type=Path)
+    for name, text in (
+        ("export", "write Spark-path results and transport summary from the experiment database"),
+        ("spark-run", "export the Spark-path results, process the baseline and evaluate"),
+    ):
+        command = commands.add_parser(name, help=text)
+        command.add_argument("--run-dir", type=Path, required=True)
+        command.add_argument("--database", required=True, help="experiment MongoDB database")
+        command.add_argument("--mongo-uri", help="default: MONGO_URI or mongodb://127.0.0.1:27017")
+        if name == "export":
+            command.add_argument("--output-dir", type=Path, help=f"default: <run-dir>/{SPARK_DIR}")
+        else:
+            command.add_argument("--snapshot", type=Path, required=True)
+            command.add_argument("--catalog", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "process-baseline":
@@ -634,6 +749,13 @@ def main(argv: list[str] | None = None) -> int:
             save_results(process_replay(args.replay, rule_version=args.rule_version), args.output)
             print(f"wrote {args.output}")
             return 0
+        if args.command == "export":
+            with _open_experiment_store(args.mongo_uri, args.database) as repository:
+                transport = export_store(
+                    repository, args.run_dir, args.output_dir or args.run_dir / SPARK_DIR
+                )
+            print(json.dumps({"checks": transport["checks"]}, indent=2, sort_keys=True))
+            return 0 if all(v for v in transport["checks"].values() if v is not None) else 1
         if args.command == "evaluate":
             report = evaluate_run(
                 manifest_path=args.manifest,
@@ -641,7 +763,11 @@ def main(argv: list[str] | None = None) -> int:
                 experiment_results_path=args.experiment,
                 output_directory=args.output_dir,
                 catalog_path=args.catalog,
+                transport_path=args.transport,
             )
+        elif args.command == "spark-run":
+            with _open_experiment_store(args.mongo_uri, args.database) as repository:
+                report = _spark_run(args.run_dir, args.snapshot, args.catalog, repository)
         else:
             report = _run(args.run_dir, args.snapshot, args.catalog)
     except (OSError, ValueError) as error:

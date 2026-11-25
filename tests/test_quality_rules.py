@@ -171,7 +171,6 @@ class QuarantineTests(unittest.TestCase):
         self.assertQuarantined(b'{"value": NaN}', "invalid_json")
         self.assertQuarantined(encode(missing_station), "missing_required_field")
         self.assertQuarantined(encode(collector_rejected), "collector_rejected")
-        self.assertQuarantined(encode(envelope(pollutant="no2", hashes=False)), "unsupported_pollutant")
         self.assertQuarantined(encode(envelope(schema_version=2, hashes=False)), "invalid_envelope")
         self.assertQuarantined(
             encode(envelope(period_end="2026-01-01T00:00:00Z", hashes=False)), "invalid_envelope"
@@ -200,6 +199,86 @@ class QuarantineTests(unittest.TestCase):
             evaluate_payload(b"{}", source_topic="air_quality_raw", rule_version="unknown")
         with self.assertRaises(TypeError):
             evaluate_payload("{}", source_topic="air_quality_raw", rule_version=RULE_VERSION)
+
+
+class OtherPollutantTests(unittest.TestCase):
+    """Non-PM2.5 envelopes are kept with a flag, as the live path stores them."""
+
+    def other(self, *, value=12.5, flags=(), **changes):
+        record = envelope(hashes=False, value=value, pollutant="no2", **changes)
+        record["source_flags"] = list(flags)
+        record.update(zip(("event_id", "revision_hash"), _live_hashes(record)))
+        return record
+
+    def test_accepted_with_flag_and_never_usable(self):
+        decision = evaluate(encode(self.other()))
+        self.assertEqual(decision["disposition"], "accepted")
+        self.assertEqual(decision["quality_flags"], ["unsupported_pollutant"])
+        self.assertFalse(decision["usable"])
+        self.assertIsNone(decision["value_ug_m3"])
+        self.assertEqual(decision["repair_actions"], [])
+
+    def test_identity_matches_the_live_hashes_and_differs_from_pm25(self):
+        record = self.other()
+        decision = evaluate(encode(record))
+        self.assertEqual(
+            (decision["event_id"], decision["revision_hash"]),
+            (record["event_id"], record["revision_hash"]),
+        )
+        self.assertNotEqual(decision["event_id"], envelope()["event_id"])
+
+    def test_missing_value_and_source_flags_are_also_flagged(self):
+        decision = evaluate(encode(self.other(value=None, flags=["suspect"])))
+        self.assertEqual(
+            decision["quality_flags"],
+            ["unsupported_pollutant", "missing_value", "source_flagged"],
+        )
+
+    def test_unit_is_not_converted_and_numeric_string_still_repairs(self):
+        record = self.other(unit="ppb")
+        record["value"] = "12.5"
+        decision = evaluate(encode(record))
+        self.assertEqual(decision["repair_actions"], ["numeric_string_parsed"])
+        self.assertEqual(decision["quality_flags"], ["unsupported_pollutant"])
+
+    def test_tampering_and_structure_are_still_checked(self):
+        tampered = self.other()
+        tampered["value"] = 99
+        self.assertQuarantined(encode(tampered), "integrity_mismatch")
+        self.assertQuarantined(
+            encode(envelope(hashes=False, pollutant="no2", period_end="2026-01-01T00:00:00Z")),
+            "invalid_envelope",
+        )
+        self.assertQuarantined(encode(envelope(hashes=False, pollutant="")), "invalid_envelope")
+        self.assertQuarantined(encode(envelope(hashes=False, pollutant=5)), "invalid_envelope")
+
+    def assertQuarantined(self, payload, reason):
+        decision = evaluate(payload)
+        self.assertEqual((decision["disposition"], decision["reason"]), ("quarantined", reason))
+
+    def test_live_document_agrees_when_available(self):
+        try:
+            from database.documents import measurement_document
+        except ImportError:
+            self.skipTest("pymongo is not installed")
+        record = self.other(value=None, flags=["suspect"])
+        document = measurement_document(record)
+        decision = evaluate(encode(record))
+        self.assertEqual(document["event_id"], decision["event_id"])
+        self.assertEqual(
+            set(document["quality_flags"]) | {"unsupported_pollutant"},
+            set(decision["quality_flags"]),
+        )
+
+
+def _live_hashes(record):
+    """The live path's identity/revision formula (database.documents)."""
+    from models import digest
+
+    identity = {f: record[f] for f in ("source", "station_id", "sensor_id", "pollutant")}
+    identity.update(period_start=record["period_start"], period_end=record["period_end"])
+    revision = {**identity, **{f: record[f] for f in ("value", "unit", "source_flags", "provider_payload")}}
+    return digest(identity), digest(revision)
 
 
 class SelectionTests(unittest.TestCase):

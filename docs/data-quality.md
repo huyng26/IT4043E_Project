@@ -7,10 +7,12 @@ wrapper/decision/manifest contracts, snapshot profiling, coverage arithmetic and
 deterministic fault builder (`python -m streaming.quality_replay build`) exist and
 are tested without infrastructure, as do the missing-interval and
 correction-to-null group scenarios and the local evaluator
-(`python -m streaming.quality_evaluation run`). Flatlines and anomaly warnings,
-Kafka publication, the replay topic and dispatcher, timeliness and restart
-measurements, quality views and the full experiments below are not implemented,
-and none of the new code is wired into the live path.
+(`python -m streaming.quality_evaluation run`). The isolated transport path is
+implemented too: publication to the `quality_replay_raw` topic, the wrapper
+dispatcher, experiment-only MongoDB collections, a separate Spark job and transport
+grading with timeliness. Flatlines and anomaly warnings, automated restart
+measurements, batch reconciliation, quality views and the full experiments below
+are not implemented, and none of the new code is wired into the live path.
 The [system design](system-design.md) remains authoritative for the whole system.
 See the [implementation map](data-quality-implementation.md) for placeholder
 locations, required changes to existing code and the build order.

@@ -17,7 +17,7 @@ from dataclasses import fields
 from datetime import datetime
 from typing import Any
 
-from models import MeasurementEvent, timestamp, utc_time
+from models import MeasurementEvent, digest, timestamp, utc_time
 from streaming.measurements import parse_measurement
 from streaming.quality.contracts import (
     REPAIR_ACTIONS,
@@ -158,8 +158,8 @@ def _evaluate(payload: bytes, received: str, rule_version: str) -> dict[str, obj
         raise _Quarantine(
             "missing_required_field", "missing required fields: " + ", ".join(sorted(missing))
         )
-    if isinstance(raw["pollutant"], str) and raw["pollutant"] != "pm25":
-        raise _Quarantine("unsupported_pollutant", "only pm25 is supported initially")
+    pollutant = raw["pollutant"]
+    other_pollutant = isinstance(pollutant, str) and pollutant.strip() and pollutant != "pm25"
 
     actions = set()
     value, repaired = _repair_value(raw["value"])
@@ -168,29 +168,43 @@ def _evaluate(payload: bytes, received: str, rule_version: str) -> dict[str, obj
     if _normalized_timestamps(raw):
         actions.add("timestamp_normalized_to_utc")
 
-    candidate = {**raw, "value": value}
+    # Other pollutants share the envelope's structure but not the PM2.5 value
+    # rules, so validate the structure as PM2.5 and keep their own identity.
+    candidate = {**raw, "value": value, "pollutant": "pm25" if other_pollutant else pollutant}
     try:
         measurement = parse_measurement(candidate)
     except (ValueError, OverflowError) as error:
         raise _Quarantine("invalid_envelope", str(error)) from error
 
+    if other_pollutant:
+        event_id, revision_hash = _observation_hashes({**candidate, "pollutant": pollutant})
+        flags = ["unsupported_pollutant"]
+        if value is None:
+            flags.append("missing_value")
+        if raw["source_flags"]:
+            flags.append("source_flagged")
+        value_ug_m3 = None
+    else:
+        event_id, revision_hash = measurement.event_id, measurement.revision_hash
+        flags, value_ug_m3 = list(measurement.quality_flags), measurement.value_ug_m3
+        if value_ug_m3 is not None and raw["unit"] in _UNIT_ACTIONS:
+            actions.add(_UNIT_ACTIONS[raw["unit"]])
+
     # Claimed hashes must match the content after representation repair; this
     # catches tampering without rejecting an exactly round-tripped repair.
-    if "event_id" in raw and raw["event_id"] != measurement.event_id:
+    if "event_id" in raw and raw["event_id"] != event_id:
         raise _Quarantine("integrity_mismatch", "event_id does not match the payload")
     claimed = raw.get("revision_hash")
-    if "revision_hash" in raw and claimed != measurement.revision_hash:
+    if "revision_hash" in raw and claimed != revision_hash:
         raise _Quarantine(
             "integrity_mismatch", "revision_hash does not match the payload"
         )
 
-    if measurement.value_ug_m3 is not None and raw["unit"] in _UNIT_ACTIONS:
-        actions.add(_UNIT_ACTIONS[raw["unit"]])
     return accepted_decision(
         rule_version=rule_version,
         received_sha256=received,
-        event_id=measurement.event_id,
-        revision_hash=measurement.revision_hash,
+        event_id=event_id,
+        revision_hash=revision_hash,
         claimed_revision_hash=claimed if isinstance(claimed, str) else None,
         station_id=measurement.station_id,
         sensor_id=measurement.sensor_id,
@@ -200,10 +214,34 @@ def _evaluate(payload: bytes, received: str, rule_version: str) -> dict[str, obj
         ingested_at=timestamp(measurement.ingested_at),
         received_value=raw["value"],
         received_unit=raw["unit"],
-        value_ug_m3=measurement.value_ug_m3,
-        quality_flags=measurement.quality_flags,
+        value_ug_m3=value_ug_m3,
+        quality_flags=flags,
         repair_actions=[a for a in REPAIR_ACTIONS if a in actions],
     )
+
+
+def _observation_hashes(envelope: Mapping[str, Any]) -> tuple[str, str]:
+    """Identity and revision hashes with the same fields as ``MeasurementEvent``.
+
+    Used for pollutants that ``MeasurementEvent`` does not model, so their claimed
+    hashes are checked exactly like the live path checks them.
+    """
+    identity = {
+        "source": envelope["source"],
+        "station_id": envelope["station_id"],
+        "sensor_id": envelope["sensor_id"],
+        "pollutant": envelope["pollutant"],
+        "period_start": timestamp(utc_time(envelope["period_start"], "period_start")),
+        "period_end": timestamp(utc_time(envelope["period_end"], "period_end")),
+    }
+    revision = {
+        **identity,
+        "value": envelope["value"],
+        "unit": envelope["unit"],
+        "source_flags": list(envelope["source_flags"]),
+        "provider_payload": envelope["provider_payload"],
+    }
+    return digest(identity), digest(revision)
 
 
 def select_current_decisions(

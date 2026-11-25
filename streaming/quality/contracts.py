@@ -59,7 +59,6 @@ QUARANTINE_REASONS = (
     "missing_required_field",
     "missing_timezone",
     "unparseable_value",
-    "unsupported_pollutant",
     "integrity_mismatch",
     "invalid_envelope",
 )

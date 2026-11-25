@@ -13,51 +13,85 @@ what is next, and the rules that are easy to break. The design is in
 | 1 | Contracts (wrapper, decision, manifest), snapshot profiling, coverage arithmetic | **Done**, local only |
 | 2 | Shared rules `rules-v1`, seeded single-fault / `mixed-v1` / control replay builder | **Done** |
 | 3 | `missing_interval` and `correction_to_null` scenarios, manifest-free local processing, evaluator and saved report | **Done** |
-| 4 | Persistence schema, wrapper dispatcher, `publish_replay`, isolated Kafka topic + Spark job + database/checkpoint | **Not started** |
+| 4 | Persistence schema, wrapper dispatcher, `publish_replay`, isolated Kafka topic + Spark job + database/checkpoint, transport grading | **Done**, verified end to end with compose |
 | 5 | HDFS archive snapshots, batch rebuild with the same rules, speed/batch comparison | Not started (needs HDFS and batch from the main plan) |
 | 6 | API/dashboard quality views, quality features for forecasting | Not started |
 
-Everything done so far runs locally with the standard library only. **None of it is
-wired into the live collector, Spark or MongoDB path**, and no real collected
-snapshot has been profiled yet: all runs used synthetic fixtures
-(`tests/quality_support.py`). Profiling a frozen real sample is still owed.
+Steps 1–3 run with the standard library only; step 4 uses Kafka, Spark and MongoDB
+through the compose `quality` profile and is unit-tested with fakes
+(`tests/test_quality_transport.py`). **None of it is wired into the live collector,
+Spark or MongoDB path.**
 
-## Next step: step 4
+### Step 4 verification (2026-11-25)
 
-1. Decide how non-PM2.5 pollutants are handled (see "Open decisions").
-2. `streaming/quality/dispatcher.py`: decode `quality_replay_raw` wrappers and call
-   `evaluate_payload`; project into an experiment-only database. Use the retry-safe
-   keys already defined: `experiment_decision_key(run_id, delivery_id, rule_version)`.
-3. `database/quality_schema.py` and repository methods through the existing
-   `database.MongoDB`; do not add another client. Add migration/version handling.
-4. `publish_replay` in `streaming/quality_replay.py` using `KafkaManager`: preserve
-   delivery IDs and bytes on retry, honor `scheduled_release_index`, record ACKs.
-5. A separately selected Spark entry point with its own checkpoint and database. Do
-   not subscribe the live writer to the replay topic.
-6. Extend `evaluate_run` with the measurements that need transport: timeliness and
-   restart recovery (listed under `not_assessed` in the report), and assert counts
-   after repeated publication.
+Both runs went through real Kafka and Spark (`quality-spark` container) and were
+graded with `spark-run`. Spark's stored decisions were identical to local
+processing in both.
 
-Still placeholders (raise `NotImplementedError`): `streaming/quality/dispatcher.py`,
-`streaming/quality_batch.py`, `database/quality_schema.py`, `api/quality.py`,
-`ml/quality_features.py`, `publish_replay`. Flatline scenarios are rejected on
+* **Synthetic** (72 records, all 9 faults + both group scenarios, 76 deliveries,
+  published twice): every check passed, including the 5 transport checks.
+  152 Kafka records gave 76 decisions; 76 redeliveries were counted, not duplicated.
+* **Real sample** (3,000 `air_quality_raw` envelopes frozen from the collector
+  outbox, 2,996 deliveries): passed. The job was killed after 745 decisions and
+  restarted from its checkpoint: 2,996 decisions, none lost or duplicated. A second
+  publication while the job ran: latency p50 9.9 s, p95 16.7 s, max 18.5 s with a
+  2 s trigger and 300 records per batch (includes queueing behind that limit).
+* **Real-data findings:** every stored envelope has `source_flagged` because it was
+  collected before commit `5bf84c9` (the old collector flagged
+  `flagInfo {"hasFlags": false}`), so nothing in the sample is usable and the
+  usable-value scores are trivial. `supported_unit_variation`, `unsupported_unit`
+  and `correction_to_null` selected nothing: the injector expects the unit spelled
+  `ug/m3` and an unflagged value, while real rows use `µg/m³`. 76% of the sample is
+  not PM2.5 (now accepted with `unsupported_pollutant`).
+
+## Next step
+
+Step 5 (HDFS archive and batch rebuild) needs HDFS and the batch layer from the main
+plan, which do not exist yet. Useful work before that:
+
+1. **Re-derive real envelopes with the fixed collector.** Regenerate measurement
+   envelopes from the stored `raw_responses` (or re-collect) so `source_flagged` is
+   not on every row, then freeze and profile a new sample with a catalog.
+2. **Injector on real data:** let `supported_unit_variation`/`unsupported_unit` and
+   `correction_to_null` accept `µg/m³` rows (an `injector-v2`; keep v1 output
+   reproducible).
+3. **Automate restart recovery** (currently a manual stop/start, see the
+   implementation map) and add a freeze command instead of the one-off export.
+4. Live quality writes for the four live topics are not designed yet; keep them
+   separate from the experiment collections.
+
+Still placeholders (raise `NotImplementedError`): `streaming/quality_batch.py`,
+`api/quality.py`, `ml/quality_features.py`. Flatline scenarios are rejected on
 purpose: they need the deferred anomaly warnings.
 
 ## Run and test
 
 ```sh
-python -m unittest discover -s tests          # 115 tests, 2 skipped without collector deps
+python -m unittest discover -s tests          # 178 tests; collector/pymongo tests skip without deps
 cp config/quality.example.json data/outputs/my-quality.json   # set "enabled": true in the copy
 python -m streaming.quality_replay build --config data/outputs/my-quality.json \
     --snapshot <snapshot.jsonl> --output-dir data/outputs/<run>
 python -m streaming.quality_evaluation run --run-dir data/outputs/<run> \
     --snapshot <snapshot.jsonl> [--catalog <catalog.json>]
+
+# step 4, through Kafka and Spark (experiment database only):
+docker compose --profile quality up -d --wait mongodb kafka
+docker compose --profile quality up kafka-init
+python -m streaming.quality_replay publish --run-dir data/outputs/<run>
+docker compose --profile quality run --rm quality-spark --run-id <run_id> --available-now
+python -m streaming.quality_evaluation spark-run --run-dir data/outputs/<run> \
+    --snapshot <snapshot.jsonl> --database urban_air_quality_quality
 ```
 
 - Python 3.11 or newer is required. The conda env `huync` was upgraded from 3.10 to
   3.12 for this. If the `conda` shell function fails with a permission error, call
   `/usr/bin/conda` or `~/.conda/envs/huync/bin/python` directly.
 - Tests use `unittest` only. Generated runs belong in the git-ignored `data/outputs/`.
+  `huync` now has `pymongo`, `kafka-python`, `requests` and `python-dotenv`; Spark
+  runs only inside the `urban-air-quality-spark:local` image.
+- Real data lives in `urban_air_quality_collector.collector_outbox` (the serving
+  database was never populated). Step 4's verification runs are in
+  `data/outputs/e2e/` and the frozen sample in `data/outputs/real/`.
 - Building or evaluating refuses to overwrite an existing run; use a new directory.
 - Reading the report (`<run>/evaluation/evaluation.json`): `passed` is true when no
   assessable check failed; a `null` check (for example `corrections_effective`
@@ -83,14 +117,21 @@ python -m streaming.quality_evaluation run --run-dir data/outputs/<run> \
 - `missing_value` and `unsupported_unit` are both fault names and legitimate
   quality-flag names, so they cannot be used as markers when testing for label leaks.
 - Mutation-check new evaluator logic: break it on purpose and confirm a test fails.
+- **The experiment database must never be a live one.** `check_experiment_database`
+  and `initialize_quality` refuse live names and databases with live collections;
+  the quality job reads only `quality_replay*` topics and never the live checkpoint.
+  Do not add the replay topic to `streaming.processing.TOPICS`.
+- Decisions are insert-once by `(run_id, delivery_id, rule_version)`; receipts by
+  Kafka topic/partition/offset. Do not "update" a stored decision: a different
+  payload under the same delivery ID is a `conflicting_redelivery` rejection.
 
 ## Open decisions
 
-- **Non-PM2.5 pollutants.** `rules-v1` quarantines them as `unsupported_pollutant`
-  because `MeasurementEvent` is PM2.5-only, but the live path stores them. Before
-  rules are applied to live data, make them accepted-with-flag instead.
+- **Non-PM2.5 pollutants: decided.** Accepted with flag `unsupported_pollutant`,
+  never usable (matches the live path). Revisit when other pollutants get value rules.
 - **Absent hashes.** The rules accept records without `event_id`/`revision_hash`
   (fixtures); the live path requires them. Decide whether the dispatcher keeps that
   leniency.
-- **Real snapshot.** Freeze and profile a real collected sample (with its catalog)
-  before reporting any figure as an OpenAQ data-quality result.
+- **Real snapshot.** A 3,000-record sample was frozen and profiled, but it predates
+  the collector flag fix, so it is not fit for reporting data-quality figures. Use a
+  re-derived sample with its catalog before reporting any OpenAQ result.

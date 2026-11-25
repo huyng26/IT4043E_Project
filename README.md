@@ -90,16 +90,28 @@ correction-to-null scenarios) and an evaluator that scores a corrupted run again
 its unmodified baseline:
 
 ```sh
-# copy config/quality.example.json, set "enabled": true, then:
-python3 -m streaming.quality_replay build --config my-quality.json \
-    --snapshot data/frozen.jsonl --output-dir runs/demo
-python3 -m streaming.quality_evaluation run --run-dir runs/demo \
+# copy config/quality.example.json to data/outputs/, set "enabled": true, then:
+python3 -m streaming.quality_replay build --config data/outputs/my-quality.json \
+    --snapshot data/frozen.jsonl --output-dir data/outputs/demo
+python3 -m streaming.quality_evaluation run --run-dir data/outputs/demo \
     --snapshot data/frozen.jsonl
 ```
 
-Kafka publication, the isolated Spark job, flatline scenarios and the quality
-views are still planned, and none of this is wired into the live pipeline or the
-existing run commands. Remaining placeholders and the required integration changes
+The same run can go through real Kafka and Spark, isolated from live data: the
+`quality` compose profile starts only MongoDB, Kafka and a separate Spark job that
+reads the `quality_replay_raw` topic and writes to its own experiment database.
+
+```sh
+docker compose --profile quality up -d --wait mongodb kafka
+docker compose --profile quality up kafka-init
+python3 -m streaming.quality_replay publish --run-dir data/outputs/demo
+docker compose --profile quality run --rm quality-spark --run-id <run_id> --available-now
+python3 -m streaming.quality_evaluation spark-run --run-dir data/outputs/demo \
+    --snapshot data/frozen.jsonl --database urban_air_quality_quality
+```
+
+Flatline scenarios, batch reconciliation and the quality views are still planned,
+and none of this is wired into the live pipeline or the existing run commands. Remaining placeholders and the required integration changes
 are listed in the [quality implementation map](docs/data-quality-implementation.md);
 the [quality handoff](docs/quality-handoff.md) records progress and the next step.
 
