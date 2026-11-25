@@ -535,6 +535,12 @@ class MongoDB:
             query["source"] = source
         return self.db.raw_responses.find(query).sort("collected_at", 1)
 
+    def iter_raw_responses(self, kind=None, limit=0):
+        """Read captured responses in capture order (read-only, for re-derivation)."""
+        query = {"context.kind": kind} if kind else {}
+        cursor = self.db.raw_responses.find(query).sort([("collected_at", 1), ("_id", 1)])
+        return cursor.limit(limit).batch_size(200) if limit else cursor.batch_size(200)
+
     def finish_response(self, request_id):
         self.db.raw_responses.update_one(
             {"_id": request_id}, {"$set": {"staged_at": now()}}
@@ -559,6 +565,48 @@ class MongoDB:
             },
             upsert=True,
         )
+
+    def iter_outbox_with_flag(self, topic, flag):
+        """Unpublished outbox rows of ``topic`` whose envelope carries ``flag``."""
+        return (
+            self.db.collector_outbox.find(
+                {"topic": topic, "published_at": None, "envelope.source_flags": flag}
+            )
+            .sort("_id", 1)
+            .batch_size(500)
+        )
+
+    def replace_unpublished_envelopes(self, replacements, *, repair):
+        """Swap envelopes of rows that are still unpublished and unchanged.
+
+        ``replacements`` are ``(identity, old_revision_hash, envelope)``. A row that
+        was published or changed since it was read is left alone. Returns the
+        number of rows replaced.
+        """
+        from pymongo import UpdateOne
+
+        operations = [
+            UpdateOne(
+                {
+                    "_id": identity,
+                    "published_at": None,
+                    "revision_hash": old_revision,
+                },
+                {
+                    "$set": {
+                        "envelope": envelope,
+                        "event_id": envelope.get("event_id"),
+                        "revision_hash": envelope.get("revision_hash"),
+                        "repair": repair,
+                        "repaired_at": now(),
+                    }
+                },
+            )
+            for identity, old_revision, envelope in replacements
+        ]
+        if not operations:
+            return 0
+        return self.db.collector_outbox.bulk_write(operations, ordered=False).modified_count
 
     def pending_outbox(self, limit=1000):
         self._limit(limit)

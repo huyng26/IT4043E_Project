@@ -74,7 +74,12 @@ python -m streaming.quality_replay build --config my-quality.json \
 Profiles are `control` (snapshot bytes unchanged), `single-fault` (exactly one
 fault type) and `mixed-v1` (balanced round-robin over the configured faults).
 `selected_input_fraction` applies to valid PM2.5 deliveries (to eligible ones for
-`single-fault`); natural defects pass through unmutated. Selection uses
+`single-fault`); natural defects pass through unmutated.
+`injector_version` selects the fault generator and is part of the run ID and the
+manifest. `injector-v1` (the default when the key is absent, so old configs
+reproduce byte for byte) starts unit faults and `correction_to_null` only from
+`ug/m3`; `injector-v2` (set in the example config) also starts them from `µg/m³`
+and `μg/m³`, the spellings real OpenAQ rows use. Selection uses
 `sha256(seed, record, fault)`; the run ID, delivery IDs, release order and both
 output files are byte-reproducible for the same snapshot, config and code. Outputs
 are created exclusively and an existing run is never overwritten. Expected outcomes in

@@ -8,6 +8,7 @@
     "catalog_path": null,
     "output_directory": null,
     "seed": 4043,
+    "injector_version": "injector-v2",
     "profile": "mixed-v1",
     "selected_input_fraction": 0.2,
     "fault_types": [

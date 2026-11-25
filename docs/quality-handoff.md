@@ -49,15 +49,28 @@ processing in both.
 Step 5 (HDFS archive and batch rebuild) needs HDFS and the batch layer from the main
 plan, which do not exist yet. Useful work before that:
 
-1. **Re-derive real envelopes with the fixed collector.** Regenerate measurement
-   envelopes from the stored `raw_responses` (or re-collect) so `source_flagged` is
-   not on every row, then freeze and profile a new sample with a catalog.
-2. **Injector on real data:** let `supported_unit_variation`/`unsupported_unit` and
-   `correction_to_null` accept `µg/m³` rows (an `injector-v2`; keep v1 output
-   reproducible).
-3. **Automate restart recovery** (currently a manual stop/start, see the
+1. **Real envelopes re-derived (done 2026-11-25).** `python -m collectors.regenerate`
+   reran the fixed adapter over all 21,477 captured pages: 548,177 envelopes (same
+   count and `event_id`s as the outbox), 6,820 genuinely flagged instead of all.
+   Output: `data/outputs/real/regenerated.jsonl` (683 MB, git-ignored, SHA-256 in
+   its `.report.json`). The same 3,000 records re-derived
+   (`snapshot-3000-regenerated.jsonl`) give 234 usable PM2.5 observations instead
+   of 0; a local mixed run on them passed with 46 lost sensor-hours, all explained.
+   Still owed: a catalog for that sample.
+2. **Stale outbox rows repaired (done 2026-11-25).** All 541,357 unpublished
+   flagged rows were rewritten in place by `python -m collectors.regenerate
+   --repair-outbox` (original timestamps and lineage kept, marked
+   `repair: openaq-hasflags-false-5bf84c9`). None had been published. Backup before
+   the change: `data/outputs/backups/collector_outbox_air_quality_raw-before-flag-repair.archive.gz`
+   (95 MB, verified by a full test restore); restore with
+   `mongorestore --gzip --archive` if ever needed.
+3. **injector-v2 (done 2026-11-25).** Unit faults and `correction_to_null` also start
+   from `µg/m³`/`μg/m³`. On the regenerated real sample all 10 fault types fire and
+   score precision/recall 1.0 (`data/outputs/e2e/real-v2-run`). v1 stays the
+   default when a config names no version.
+4. **Automate restart recovery** (currently a manual stop/start, see the
    implementation map) and add a freeze command instead of the one-off export.
-4. Live quality writes for the four live topics are not designed yet; keep them
+5. Live quality writes for the four live topics are not designed yet; keep them
    separate from the experiment collections.
 
 Still placeholders (raise `NotImplementedError`): `streaming/quality_batch.py`,
@@ -132,6 +145,7 @@ python -m streaming.quality_evaluation spark-run --run-dir data/outputs/<run> \
 - **Absent hashes.** The rules accept records without `event_id`/`revision_hash`
   (fixtures); the live path requires them. Decide whether the dispatcher keeps that
   leniency.
-- **Real snapshot.** A 3,000-record sample was frozen and profiled, but it predates
-  the collector flag fix, so it is not fit for reporting data-quality figures. Use a
-  re-derived sample with its catalog before reporting any OpenAQ result.
+- **Real snapshot.** Use `snapshot-3000-regenerated.jsonl` (or a new sample from
+  `regenerated.jsonl`), not `snapshot-3000.jsonl`, which predates the flag fix. Add
+  its catalog before reporting coverage or gap figures as OpenAQ results.
+- **Stale outbox rows: resolved** (see "Next step", item 2).

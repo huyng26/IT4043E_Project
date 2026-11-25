@@ -46,7 +46,15 @@ from streaming.quality.contracts import (
 from streaming.quality.local_run import read_snapshot_lines
 from streaming.quality.rules import SUPPORTED_RULE_VERSIONS
 
-INJECTOR_VERSION = "injector-v1"
+INJECTOR_VERSION = "injector-v1"  # used when a config names no version
+INJECTOR_VERSIONS = ("injector-v1", "injector-v2")
+# Spellings of ug/m3 a fault may start from. v1 only knew the canonical one, so on
+# real OpenAQ rows ("µg/m³") the unit faults and correction_to_null never fired.
+# v2 adds the micro-sign and Greek-mu aliases the shared rules already accept.
+CONCENTRATION_UNITS = {
+    "injector-v1": frozenset({"ug/m3"}),
+    "injector-v2": frozenset({"ug/m3", "µg/m³", "μg/m³"}),
+}
 UNIT_POLICY_VERSION = "units-v1"
 TIMEZONE_POLICY_VERSION = "timezone-v1"
 SOURCE_TOPIC = "air_quality_raw"
@@ -125,9 +133,9 @@ def _is_number(value: object) -> bool:
     return type(value) in (int, float)
 
 
-def _unit_variation(record: _Input, seed: int) -> _Mutation | None:
+def _unit_variation(record: _Input, seed: int, units: frozenset[str]) -> _Mutation | None:
     envelope = dict(record.envelope or {})
-    if not _is_number(envelope.get("value")) or envelope.get("unit") != "ug/m3":
+    if not _is_number(envelope.get("value")) or envelope.get("unit") not in units:
         return None
     envelope.update(value=envelope["value"] / 1000, unit="mg/m3")
     return _Mutation(
@@ -197,9 +205,9 @@ def _malformed_payload(record: _Input, seed: int) -> _Mutation | None:
     )
 
 
-def _unsupported_unit(record: _Input, seed: int) -> _Mutation | None:
+def _unsupported_unit(record: _Input, seed: int, units: frozenset[str]) -> _Mutation | None:
     envelope = dict(record.envelope or {})
-    if envelope.get("unit") != "ug/m3":
+    if envelope.get("unit") not in units:
         return None
     envelope["unit"] = "ppm"
     return _Mutation(
@@ -217,15 +225,18 @@ _PAYLOAD_FAULTS = {
     "malformed_payload": _malformed_payload,
     "unsupported_unit": _unsupported_unit,
 }
+_UNIT_FAULTS = frozenset({"supported_unit_variation", "unsupported_unit"})
 
 
-def _plan_mutation(fault: str, record: _Input, seed: int) -> _Mutation | None:
+def _plan_mutation(fault: str, record: _Input, seed: int, units: frozenset[str]) -> _Mutation | None:
     if record.envelope is None:
         return None
     if fault == "duplicate_delivery":
         return _Mutation(None, {}, {"disposition": "accepted", "contributes_to_aggregate": False})
     if fault == "delayed_delivery":
         return _Mutation(None, {}, {"disposition": "accepted", "logical_result_unchanged": True})
+    if fault in _UNIT_FAULTS:
+        return _PAYLOAD_FAULTS[fault](record, seed, units)
     return _PAYLOAD_FAULTS[fault](record, seed)
 
 
@@ -281,6 +292,9 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
         or not 0 <= group_fraction <= 1
     ):
         raise ValueError("group_fraction must be between 0 and 1")
+    injector_version = experiment.get("injector_version", INJECTOR_VERSION)
+    if injector_version not in INJECTOR_VERSIONS:
+        raise ValueError(f"injector_version must be one of {INJECTOR_VERSIONS}")
     if experiment.get("topic", REPLAY_TOPIC) != REPLAY_TOPIC:
         raise ValueError(f"topic must be {REPLAY_TOPIC}")
     faults = list(experiment.get("fault_types") or [])
@@ -303,6 +317,7 @@ def _validate_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "faults": faults,
         "scenarios": scenarios,
         "group_fraction": group_fraction,
+        "injector_version": injector_version,
         "run_id": experiment.get("run_id"),
         "catalog_path": experiment.get("catalog_path"),
         "code_revision": config.get("code_revision"),
@@ -334,14 +349,14 @@ def _current_record(records: list[_Input]) -> _Input:
     )
 
 
-def _can_lose_usable_value(record: _Input) -> bool:
+def _can_lose_usable_value(record: _Input, units: frozenset[str]) -> bool:
     """Hand-written check that a null correction would remove a usable value."""
     envelope = record.envelope or {}
     value = envelope.get("value")
     return (
         _is_number(value)
         and value >= 0
-        and envelope.get("unit") == "ug/m3"
+        and envelope.get("unit") in units
         and not envelope.get("source_flags")
     )
 
@@ -354,6 +369,7 @@ def _plan_groups(records: list[_Input], settings: dict[str, Any]):
     that row faults must leave alone.
     """
     scenarios, seed, fraction = settings["scenarios"], settings["seed"], settings["group_fraction"]
+    units = CONCENTRATION_UNITS[settings["injector_version"]]
     groups: dict[tuple[str, str, str], list[_Input]] = {}
     for record in records:
         key = _hour_group(record)
@@ -372,7 +388,7 @@ def _plan_groups(records: list[_Input], settings: dict[str, Any]):
         eligible = [
             key
             for key in groups
-            if key not in omitted and _can_lose_usable_value(_current_record(groups[key]))
+            if key not in omitted and _can_lose_usable_value(_current_record(groups[key]), units)
         ]
         chosen = ranked(eligible, "correction_to_null")[: _select_count(fraction, len(eligible))]
         corrected = {key: _current_record(groups[key]) for key in sorted(chosen)}
@@ -395,6 +411,7 @@ def _correction_envelope(record: _Input) -> dict[str, Any]:
 def _plan(records: list[_Input], settings: dict[str, Any]):
     """Return ``({record_number: (fault, mutation)}, ineligible_selected)``."""
     seed, faults, fraction = settings["seed"], settings["faults"], settings["fraction"]
+    units = CONCENTRATION_UNITS[settings["injector_version"]]
     plan: dict[int, tuple[str, _Mutation]] = {}
     ineligible: list[dict[str, Any]] = []
     if not faults:
@@ -407,7 +424,7 @@ def _plan(records: list[_Input], settings: dict[str, Any]):
         fault = faults[0]
         pool = []
         for record in records:
-            mutation = _plan_mutation(fault, record, seed)
+            mutation = _plan_mutation(fault, record, seed, units)
             if mutation is not None:
                 pool.append((record, mutation))
         pool.sort(key=lambda item: score(item[0], fault))
@@ -421,7 +438,7 @@ def _plan(records: list[_Input], settings: dict[str, Any]):
         # Balanced round-robin; skip faults this record cannot carry.
         for offset in range(len(faults)):
             fault = faults[(pointer + offset) % len(faults)]
-            mutation = _plan_mutation(fault, record, seed)
+            mutation = _plan_mutation(fault, record, seed, units)
             if mutation is not None:
                 plan[record.number] = fault, mutation
                 pointer = (pointer + offset + 1) % len(faults)
@@ -444,7 +461,7 @@ def _derive_run_id(settings: dict[str, Any], snapshot_sha: str) -> str:
             settings["scenarios"],
             settings["group_fraction"],
             settings["rule_version"],
-            INJECTOR_VERSION,
+            settings["injector_version"],
         ]
     )[:16]
 
@@ -583,7 +600,7 @@ def build_replay(
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "run_id": run_id,
             "dataset_kind": EXPERIMENT_DATASET_KIND,
-            "injector_version": INJECTOR_VERSION,
+            "injector_version": settings["injector_version"],
             "seed": seed,
             "profile": settings["profile"],
             "rule_version": settings["rule_version"],

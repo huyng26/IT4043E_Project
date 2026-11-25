@@ -172,6 +172,39 @@ are retry-safe. Outbox records must finish before response staging
 is marked complete. An ACK from Kafka precedes marking an outbox row published;
 a crash between them can repeat delivery. There is no cross-system transaction.
 
+### Re-deriving measurement envelopes
+
+Envelopes staged before commit `5bf84c9` flagged OpenAQ's `flagInfo
+{"hasFlags": false}` as a source flag, so every such row looks unusable. The
+captured responses are intact, so the fixed adapter can be rerun over them into a
+new file. This is read-only: it does not change the outbox, publish to Kafka or
+touch the serving database.
+
+```sh
+.venv/bin/python -m collectors.regenerate --output data/outputs/real/regenerated.jsonl \
+    [--pollutant pm25] [--limit-responses 100]
+```
+
+Output follows capture order and is deterministic. `ingested_at` is the response's
+`collected_at`, because the original staging time was not recorded. `event_id`s
+match the outbox; revision hashes differ where flags changed. A
+`<output>.report.json` holds counts and the file's SHA-256. `--repair-outbox` instead rewrites the stale rows in the outbox itself, which is
+what the live path publishes. It changes only rows that are still unpublished and
+unchanged since they were read, recomputes each envelope from its stored
+`provider_payload` with the original timestamps, and marks the row with
+`repair`. Stop the crawler and back up the outbox first:
+
+```sh
+docker compose exec -T mongodb mongodump --db urban_air_quality_collector \
+    --collection collector_outbox --query '{"topic":"air_quality_raw"}' \
+    --gzip --archive > data/outputs/backups/outbox.archive.gz
+.venv/bin/python -m collectors.regenerate --repair-outbox --dry-run
+.venv/bin/python -m collectors.regenerate --repair-outbox
+```
+
+This was run on 2026-11-25: all 541,357 stale rows were repaired before any had
+been published.
+
 Weather keeps the explicit `gfs_seamless` model, original units, nulls/zero and
 fetch vintages. After downtime its past range expands up to the forecast API's
 92-day limit; larger gaps fail visibly and require a future archive backfill.
